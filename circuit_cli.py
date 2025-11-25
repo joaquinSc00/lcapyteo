@@ -4,8 +4,9 @@ import json
 import textwrap
 from collections import defaultdict
 from dataclasses import dataclass, field
-from typing import Dict, Iterable, List, Optional, Sequence, Set
+from typing import Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
+import sympy as sp
 from lcapy import Circuit
 from pint import UnitRegistry
 
@@ -49,7 +50,7 @@ class UnitNormalizer:
             raise ValueError("El valor numérico no puede estar vacío.")
 
         try:
-            quantity = self.unit_registry(value)
+            quantity = self.unit_registry.Quantity(value)
         except Exception as exc:  # noqa: BLE001 - Queremos mostrar el fallo de parseo
             raise ValueError(f"Valor '{value}' no reconocido: {exc}") from exc
 
@@ -64,6 +65,21 @@ class UnitNormalizer:
 
         unit_str = f"{quantity.units:~}"
         return f"{magnitude}{unit_str}"
+
+    def magnitude_in_base_units(self, value: str, component_type: str) -> float:
+        value = value.strip()
+        if not value:
+            raise ValueError("El valor numérico no puede estar vacío.")
+
+        quantity = self.unit_registry.Quantity(value)
+        if quantity.dimensionless:
+            default_unit = self.default_units.get(component_type)
+            if default_unit:
+                quantity = quantity * self.unit_registry(default_unit)
+        default_unit = self.default_units.get(component_type)
+        if default_unit:
+            quantity = quantity.to(default_unit)
+        return float(quantity.magnitude)
 
 
 @dataclass
@@ -102,8 +118,14 @@ class ComponentSpec:
         return self.normalizer.normalize_value(self.value, self.type)
 
     def netlist_line(self) -> str:
-        orientation_suffix = f" {self.orientation}" if self.orientation else ""
-        return f"{self.name} {self.node_a} {self.node_b} {self.normalized_value}{orientation_suffix}"
+        try:
+            magnitude = self.normalizer.magnitude_in_base_units(
+                self.value, self.type
+            )
+            value_token = f"{magnitude:g}"
+        except Exception:
+            value_token = self.normalized_value
+        return f"{self.name} {self.node_a} {self.node_b} {value_token}"
 
     def as_dict(self) -> Dict[str, str]:
         data = {
@@ -309,6 +331,227 @@ class SwitchedCircuit:
         return self.circuit_pre if time < 0 else self.circuit_post
 
 
+def _domain_operator(domain: str) -> sp.Expr:
+    if domain == "laplace":
+        return sp.symbols("s")
+    if domain == "jw":
+        return sp.I * sp.symbols("w")
+    return sp.symbols("d_dt")
+
+
+def _numeric_value(component: ComponentSpec) -> sp.Expr:
+    try:
+        magnitude = component.normalizer.magnitude_in_base_units(
+            component.value, component.type
+        )
+        return sp.nsimplify(magnitude)
+    except Exception:
+        return sp.symbols(f"{component.name}_val")
+
+
+def impedance_for_component(component: ComponentSpec, domain: str) -> Optional[sp.Expr]:
+    operator = _domain_operator(domain)
+    value = _numeric_value(component)
+    if component.type == "R":
+        return value
+    if component.type == "L":
+        return operator * value
+    if component.type == "C":
+        return 1 / (operator * value)
+    if component.type in {"E", "F", "G", "H", "K", "D"}:
+        return None
+    return None
+
+
+def source_value(component: ComponentSpec) -> sp.Expr:
+    try:
+        magnitude = component.normalizer.magnitude_in_base_units(
+            component.value, component.type
+        )
+        return sp.nsimplify(magnitude)
+    except Exception:
+        return sp.symbols(component.value)
+
+
+def _reference_node(graph: CircuitGraph) -> str:
+    if "0" in graph.nodes:
+        return "0"
+    if graph.reference_nodes:
+        return sorted(graph.reference_nodes)[0]
+    return sorted(graph.nodes)[0]
+
+
+def _node_voltage(node: str) -> sp.Symbol:
+    return sp.symbols(f"V_{node}")
+
+
+def nodal_equations(graph: CircuitGraph, domain: str) -> Tuple[list, List[str]]:
+    reference = _reference_node(graph)
+    node_currents: Dict[str, sp.Expr] = defaultdict(int)
+    voltage_equations: List[sp.Eq] = []
+    unsupported: List[str] = []
+
+    for component in graph.components:
+        z_value = impedance_for_component(component, domain)
+        node_a = component.node_a
+        node_b = component.node_b
+        va = _node_voltage(node_a) if node_a != reference else sp.Integer(0)
+        vb = _node_voltage(node_b) if node_b != reference else sp.Integer(0)
+
+        if z_value is not None:
+            current_ab = (va - vb) / z_value
+            node_currents[node_a] += current_ab
+            node_currents[node_b] -= current_ab
+            continue
+
+        if component.type == "I":
+            current = source_value(component)
+            node_currents[node_a] += current
+            node_currents[node_b] -= current
+            continue
+
+        if component.type == "V":
+            current_symbol = sp.symbols(f"I_{component.name}")
+            node_currents[node_a] += current_symbol
+            node_currents[node_b] -= current_symbol
+            voltage_equations.append(sp.Eq(va - vb, source_value(component)))
+            continue
+
+        unsupported.append(component.name)
+
+    kcl_equations = [
+        sp.Eq(node_currents[node], 0)
+        for node in sorted(graph.nodes)
+        if node != reference
+    ]
+
+    warnings = []
+    if unsupported:
+        warnings.append(
+            "Componentes no considerados en KCL (tipo no soportado para nodal): "
+            f"{', '.join(sorted(set(unsupported)))}"
+        )
+
+    return kcl_equations + voltage_equations, warnings
+
+
+def _build_edges(graph: CircuitGraph) -> List[Tuple[int, ComponentSpec]]:
+    return list(enumerate(graph.components))
+
+
+def _tree_adjacency(tree_edges: Set[int], edges: List[Tuple[int, ComponentSpec]]):
+    adjacency: Dict[str, List[Tuple[str, int]]] = defaultdict(list)
+    for edge_id, component in edges:
+        if edge_id not in tree_edges:
+            continue
+        adjacency[component.node_a].append((component.node_b, edge_id))
+        adjacency[component.node_b].append((component.node_a, edge_id))
+    return adjacency
+
+
+def _find_tree_path(adjacency: Dict[str, List[Tuple[str, int]]], start: str, goal: str):
+    stack = [(start, [])]
+    visited: Set[str] = set()
+    while stack:
+        node, path = stack.pop()
+        if node == goal:
+            return path
+        if node in visited:
+            continue
+        visited.add(node)
+        for neighbor, edge_id in adjacency.get(node, []):
+            if neighbor not in visited:
+                stack.append((neighbor, path + [(node, neighbor, edge_id)]))
+    return []
+
+
+def _fundamental_cycles(graph: CircuitGraph) -> List[list]:
+    edges = _build_edges(graph)
+    if not graph.nodes:
+        return []
+
+    visited_nodes: Set[str] = set()
+    tree_edges: Set[int] = set()
+    chords: List[int] = []
+    start_node = next(iter(graph.nodes))
+    queue = [start_node]
+    visited_nodes.add(start_node)
+
+    while queue:
+        node = queue.pop(0)
+        for edge_id, component in edges:
+            if edge_id in tree_edges or edge_id in chords:
+                continue
+            if node not in {component.node_a, component.node_b}:
+                continue
+            other = component.node_b if component.node_a == node else component.node_a
+            if other not in visited_nodes:
+                visited_nodes.add(other)
+                tree_edges.add(edge_id)
+                queue.append(other)
+            else:
+                chords.append(edge_id)
+
+    adjacency = _tree_adjacency(tree_edges, edges)
+    cycles: List[list] = []
+    for chord_id in chords:
+        chord_component = edges[chord_id][1]
+        start = chord_component.node_a
+        end = chord_component.node_b
+        path = _find_tree_path(adjacency, start, end)
+        cycle_edges = []
+        for frm, to, edge_id in path:
+            comp = edges[edge_id][1]
+            sign = 1 if (frm, to) == (comp.node_a, comp.node_b) else -1
+            cycle_edges.append((edge_id, sign))
+        chord_sign = 1 if (end, start) == (chord_component.node_a, chord_component.node_b) else -1
+        cycle_edges.append((chord_id, chord_sign))
+        cycles.append(cycle_edges)
+    return cycles
+
+
+def mesh_equations(graph: CircuitGraph, domain: str) -> Tuple[list, List[str]]:
+    cycles = _fundamental_cycles(graph)
+    edges = _build_edges(graph)
+    mesh_currents = [sp.symbols(f"I_M{idx+1}") for idx in range(len(cycles))]
+    edge_to_cycles: Dict[int, List[Tuple[int, int]]] = defaultdict(list)
+    warnings: List[str] = []
+
+    for cycle_idx, cycle_edges in enumerate(cycles):
+        for edge_id, sign in cycle_edges:
+            edge_to_cycles[edge_id].append((cycle_idx, sign))
+
+    equations: List[sp.Eq] = []
+    for idx, cycle_edges in enumerate(cycles):
+        expression = 0
+        for edge_id, sign in cycle_edges:
+            component = edges[edge_id][1]
+            if component.type == "I":
+                warnings.append(
+                    f"Fuente de corriente {component.name} en malla {idx+1} no se incluye en KVL."
+                )
+                continue
+
+            if component.type == "V":
+                expression += sign * source_value(component)
+                continue
+
+            impedance = impedance_for_component(component, domain)
+            if impedance is None:
+                warnings.append(
+                    f"Componente {component.name} omitido en KVL (tipo no soportado)."
+                )
+                continue
+
+            shared_current = 0
+            for other_idx, other_sign in edge_to_cycles[edge_id]:
+                shared_current += other_sign * mesh_currents[other_idx]
+            expression += sign * impedance * shared_current
+        equations.append(sp.Eq(expression, 0))
+
+    return equations, sorted(set(warnings))
+
+
 def parse_component_line(line: str, normalizer: UnitNormalizer) -> ComponentSpec:
     parts = [piece.strip() for piece in line.split(",") if piece.strip()]
     if len(parts) not in (5, 6):
@@ -360,6 +603,53 @@ def prompt_for_components(label: str, normalizer: UnitNormalizer) -> list:
     return components
 
 
+def _format_equations(equations: Sequence[sp.Eq]) -> List[str]:
+    formatted = []
+    for eq in equations:
+        formatted.append(str(sp.simplify(eq)))
+    return formatted
+
+
+def _matrix_from_equations(equations: Sequence[sp.Eq]) -> Tuple[sp.Matrix, sp.Matrix, list]:
+    parameter_names = {"s", "w", "d_dt"}
+    variable_prefixes = ("V_", "I_", "I_M")
+    symbols = sorted(
+        {
+            sym
+            for eq in equations
+            for sym in eq.free_symbols
+            if sym.name not in parameter_names
+            and sym.name.startswith(variable_prefixes)
+        },
+        key=lambda s: s.name,
+    )
+    if not symbols:
+        return sp.Matrix(), sp.Matrix(), []
+    matrix, vector = sp.linear_eq_to_matrix(equations, symbols)
+    return matrix, vector, symbols
+
+
+def symbolic_analysis(graph: CircuitGraph, domain: str, method: str, show_matrices: bool):
+    if method == "mesh":
+        equations, warnings = mesh_equations(graph, domain)
+    else:
+        equations, warnings = nodal_equations(graph, domain)
+
+    summary = {
+        "equations": _format_equations(equations),
+    }
+    if warnings:
+        summary["warnings"] = warnings
+
+    if show_matrices:
+        matrix, vector, symbols = _matrix_from_equations(equations)
+        summary["matrix_G"] = [[str(item) for item in row] for row in matrix.tolist()]
+        summary["matrix_B"] = [[str(item) for item in row] for row in vector.tolist()]
+        summary["variables"] = [str(sym) for sym in symbols]
+
+    return summary
+
+
 def build_parser() -> argparse.ArgumentParser:
     description = (
         "Constructor sencillo de topologías usando líneas de texto o archivos CSV.\n"
@@ -405,6 +695,28 @@ def build_parser() -> argparse.ArgumentParser:
             "En modo single se admite un archivo; en double, dos: primero t<0, segundo t>0."
         ),
     )
+    parser.add_argument(
+        "--method",
+        choices=["nodal", "mesh"],
+        default="nodal",
+        help="Generar ecuaciones por método nodal o por mallas (KVL).",
+    )
+    parser.add_argument(
+        "--domain",
+        choices=["laplace", "jw", "time"],
+        default="laplace",
+        help="Dominio simbólico para impedancias: s, jω o derivadas en el tiempo.",
+    )
+    parser.add_argument(
+        "--show-matrices",
+        action="store_true",
+        help="Mostrar matrices G y B (linealizadas) además de las ecuaciones simbólicas.",
+    )
+    parser.add_argument(
+        "--show-lcapy",
+        action="store_true",
+        help="Imprimir el netlist generado por lcapy para la topología procesada.",
+    )
     return parser
 
 
@@ -424,9 +736,27 @@ def print_warnings(graph: CircuitGraph, label: str) -> None:
         print(f" - {warning}")
 
 
+def print_symbolic(label: str, summary: dict, method: str, show_matrices: bool) -> None:
+    print(f"\nEcuaciones simbólicas ({method}) para {label}:")
+    for eq in summary.get("equations", []):
+        print(f" - {eq}")
+
+    for warning in summary.get("warnings", []):
+        print(f" ⚠️  {warning}")
+
+    if show_matrices and summary.get("variables"):
+        print("\nMatriz G (coeficientes):")
+        print(sp.Matrix(summary["matrix_G"]))
+        print("Vector B:")
+        print(sp.Matrix(summary["matrix_B"]))
+        print(f"Variables: {', '.join(summary['variables'])}")
+
+
 def run(args: argparse.Namespace) -> dict:
     mode = args.mode
     normalizer = UnitNormalizer()
+    domain = args.domain
+    method = args.method
 
     if args.csv:
         if mode == "single" and len(args.csv) != 1:
@@ -442,10 +772,16 @@ def run(args: argparse.Namespace) -> dict:
         graph = CircuitGraph(components)
         print_warnings(graph, "topología única")
         circuit = graph.to_lcapy_circuit()
+        analysis_summary = symbolic_analysis(graph, domain, method, args.show_matrices)
+        print_symbolic("topología única", analysis_summary, method, args.show_matrices)
+        if args.show_lcapy:
+            print("\nNetlist lcapy:")
+            print(circuit)
         result = {
             "mode": mode,
             "components": [component.as_dict() for component in components],
             "netlist": str(circuit),
+            "analysis": analysis_summary,
         }
         result.update(summarize_graph(graph, "pre"))
         return result
@@ -465,6 +801,15 @@ def run(args: argparse.Namespace) -> dict:
     circuit_pre = graph_pre.to_lcapy_circuit()
     circuit_post = graph_post.to_lcapy_circuit()
     switched = SwitchedCircuit(circuit_pre, circuit_post)
+    analysis_pre = symbolic_analysis(graph_pre, domain, method, args.show_matrices)
+    analysis_post = symbolic_analysis(graph_post, domain, method, args.show_matrices)
+    print_symbolic("topología t<0", analysis_pre, method, args.show_matrices)
+    print_symbolic("topología t>0", analysis_post, method, args.show_matrices)
+    if args.show_lcapy:
+        print("\nNetlist lcapy t<0:")
+        print(circuit_pre)
+        print("\nNetlist lcapy t>0:")
+        print(circuit_post)
 
     result = {
         "mode": mode,
@@ -473,6 +818,8 @@ def run(args: argparse.Namespace) -> dict:
         "netlist_pre": str(circuit_pre),
         "netlist_post": str(circuit_post),
         "switched_mode": "pre" if switched.for_time(-1) is circuit_pre else "post",
+        "analysis_pre": analysis_pre,
+        "analysis_post": analysis_post,
     }
     result.update(summarize_graph(graph_pre, "pre"))
     result.update(summarize_graph(graph_post, "post"))
