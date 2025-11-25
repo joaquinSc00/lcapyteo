@@ -19,6 +19,8 @@ Reglas de nodos:
 ## Uso
 El script `circuit_cli.py` admite modo de topología única (`single`) o doble (`double`, para t<0 y t>0). También permite cargar datos desde archivos CSV para evitar introducirlos a mano.
 
+Además de capturar la lista de componentes, el CLI valida cada entrada con `ComponentSpec` (tipo R, L, C, V, I, E, F, G, H, etc.), normaliza unidades con `pint` y levanta un grafo de nodos que detecta nodos de referencia implícitos o duplicados. Luego convierte cada topología en un `Circuit` de `lcapy` (o un `SwitchedCircuit` cuando hay doble topología) listo para usarse directamente en simulaciones o visualizaciones.
+
 ### Ayuda
 ```
 python circuit_cli.py --help
