@@ -4,8 +4,11 @@ import json
 import textwrap
 from collections import defaultdict
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
+import matplotlib.pyplot as plt
+import numpy as np
 import sympy as sp
 from lcapy import Circuit
 from pint import UnitRegistry
@@ -71,12 +74,16 @@ class UnitNormalizer:
         if not value:
             raise ValueError("El valor numérico no puede estar vacío.")
 
+        default_unit = self.default_units.get(component_type)
         quantity = self.unit_registry.Quantity(value)
         if quantity.dimensionless:
-            default_unit = self.default_units.get(component_type)
             if default_unit:
                 quantity = quantity * self.unit_registry(default_unit)
-        default_unit = self.default_units.get(component_type)
+        elif default_unit:
+            try:
+                quantity = quantity.to(default_unit)
+            except Exception:
+                quantity = self.unit_registry.Quantity(f"{value}{default_unit}")
         if default_unit:
             quantity = quantity.to(default_unit)
         return float(quantity.magnitude)
@@ -629,6 +636,112 @@ def _matrix_from_equations(equations: Sequence[sp.Eq]) -> Tuple[sp.Matrix, sp.Ma
     return matrix, vector, symbols
 
 
+def parse_substitutions(pairs: Optional[Sequence[str]]) -> Dict[sp.Symbol, sp.Expr]:
+    substitutions: Dict[sp.Symbol, sp.Expr] = {}
+    if not pairs:
+        return substitutions
+
+    for item in pairs:
+        if "=" not in item:
+            raise ValueError(
+                f"La sustitución '{item}' no es válida. Usa el formato nombre=valor."
+            )
+        name, raw_value = item.split("=", 1)
+        name = name.strip()
+        raw_value = raw_value.strip()
+        if not name:
+            raise ValueError("El nombre de la sustitución no puede estar vacío.")
+        substitutions[sp.symbols(name)] = sp.sympify(raw_value)
+    return substitutions
+
+
+def solve_equations(
+    equations: Sequence[sp.Eq], substitutions: Optional[Dict[sp.Symbol, sp.Expr]] = None
+) -> Dict[str, sp.Expr]:
+    substituted = [eq.subs(substitutions or {}) for eq in equations]
+    matrix, vector, symbols = _matrix_from_equations(substituted)
+    if not symbols or matrix.is_zero_matrix:
+        return {}
+
+    solution_set = sp.linsolve((matrix, vector), *symbols)
+    if not solution_set:
+        return {}
+
+    solution = next(iter(solution_set))
+    return {symbol.name: value for symbol, value in zip(symbols, solution)}
+
+
+def _ensure_parent_dir(path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+
+def _labelled_path(base_path: str, label: str) -> Path:
+    path = Path(base_path)
+    if not label:
+        return path
+    return path.with_name(f"{path.stem}_{label}{path.suffix}")
+
+
+def export_to_csv(path: str, summary: dict, solution: Dict[str, sp.Expr]) -> None:
+    csv_path = Path(path)
+    _ensure_parent_dir(csv_path)
+    with open(csv_path, "w", newline="", encoding="utf-8") as csvfile:
+        writer = csv.writer(csvfile)
+        writer.writerow(["Tipo", "Contenido"])
+        for equation in summary.get("equations", []):
+            writer.writerow(["ecuacion", equation])
+        for warning in summary.get("warnings", []):
+            writer.writerow(["advertencia", warning])
+        for var, expr in solution.items():
+            writer.writerow(["solucion", f"{var}={sp.simplify(expr)}"])
+
+
+def export_to_latex(path: str, summary: dict, solution: Dict[str, sp.Expr]) -> None:
+    latex_path = Path(path)
+    _ensure_parent_dir(latex_path)
+    lines = ["\\section*{Ecuaciones y soluciones}"]
+    if summary.get("equations"):
+        lines.append("\\subsection*{Ecuaciones}")
+        for equation in summary["equations"]:
+            lines.append(f"$${sp.latex(sp.sympify(equation))}$$")
+    if summary.get("warnings"):
+        lines.append("\\subsection*{Advertencias}")
+        for warning in summary["warnings"]:
+            lines.append(f"\\textbf{{Aviso}}: {warning}\\\\")
+    if solution:
+        lines.append("\\subsection*{Soluciones}")
+        for var, expr in solution.items():
+            lines.append(f"$${var} = {sp.latex(sp.simplify(expr))}$$")
+    latex_path.write_text("\n\n".join(lines), encoding="utf-8")
+
+
+def _plot_response(
+    expression: sp.Expr,
+    symbol: sp.Symbol,
+    start: float,
+    stop: float,
+    points: int,
+    output_path: Path,
+    label: str,
+) -> None:
+    output_path = Path(output_path)
+    _ensure_parent_dir(output_path)
+    samples = np.linspace(start, stop, points)
+    func = sp.lambdify(symbol, expression, modules=["numpy"])
+    values = func(samples)
+    plt.figure()
+    plt.plot(samples, np.real(values), label=f"Re{{{label}}}")
+    if np.any(np.imag(values)):
+        plt.plot(samples, np.imag(values), "--", label=f"Im{{{label}}}")
+    plt.xlabel(symbol.name)
+    plt.ylabel(label)
+    plt.legend()
+    plt.grid(True)
+    plt.tight_layout()
+    plt.savefig(output_path)
+    plt.close()
+
+
 def symbolic_analysis(graph: CircuitGraph, domain: str, method: str, show_matrices: bool):
     if method == "mesh":
         equations, warnings = mesh_equations(graph, domain)
@@ -637,6 +750,7 @@ def symbolic_analysis(graph: CircuitGraph, domain: str, method: str, show_matric
 
     summary = {
         "equations": _format_equations(equations),
+        "raw_equations": equations,
     }
     if warnings:
         summary["warnings"] = warnings
@@ -717,6 +831,43 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Imprimir el netlist generado por lcapy para la topología procesada.",
     )
+    parser.add_argument(
+        "--solve",
+        action="store_true",
+        help=(
+            "Resolver el sistema lineal (vías sympy) para obtener tensiones y corrientes."
+        ),
+    )
+    parser.add_argument(
+        "--substitute",
+        nargs="+",
+        metavar="NOMBRE=VALOR",
+        help=(
+            "Valores numéricos a usar en la resolución (fuentes o condiciones iniciales)."
+        ),
+    )
+    parser.add_argument(
+        "--export-csv",
+        metavar="FILE",
+        help="Guardar ecuaciones/soluciones en CSV (se añade sufijo _pre/_post en double).",
+    )
+    parser.add_argument(
+        "--export-latex",
+        metavar="FILE",
+        help="Guardar ecuaciones/soluciones en LaTeX (con sufijo _pre/_post en double).",
+    )
+    parser.add_argument(
+        "--plot-time",
+        nargs=5,
+        metavar=("VAR", "T0", "T1", "POINTS", "FILE"),
+        help="Graficar una solución en el tiempo (variable, inicio, fin, muestras, archivo).",
+    )
+    parser.add_argument(
+        "--plot-freq",
+        nargs=5,
+        metavar=("VAR", "W0", "W1", "POINTS", "FILE"),
+        help="Graficar una solución en frecuencia (variable, w0, w1, muestras, archivo).",
+    )
     return parser
 
 
@@ -744,6 +895,16 @@ def print_symbolic(label: str, summary: dict, method: str, show_matrices: bool) 
     for warning in summary.get("warnings", []):
         print(f" ⚠️  {warning}")
 
+    if summary.get("solutions"):
+        print("\nSoluciones:")
+        for var, expr in summary["solutions"].items():
+            print(f" {var} = {expr}")
+
+    if summary.get("plots"):
+        print("\nGráficas generadas:")
+        for plot_path in summary["plots"]:
+            print(f" - {plot_path}")
+
     if show_matrices and summary.get("variables"):
         print("\nMatriz G (coeficientes):")
         print(sp.Matrix(summary["matrix_G"]))
@@ -752,11 +913,88 @@ def print_symbolic(label: str, summary: dict, method: str, show_matrices: bool) 
         print(f"Variables: {', '.join(summary['variables'])}")
 
 
+def _plot_instructions(args: argparse.Namespace) -> List[dict]:
+    instructions: List[dict] = []
+    if args.plot_time:
+        var, start, stop, points, path = args.plot_time
+        instructions.append(
+            {
+                "var": var,
+                "start": float(start),
+                "stop": float(stop),
+                "points": int(points),
+                "path": Path(path),
+                "symbol": sp.symbols("t"),
+            }
+        )
+    if args.plot_freq:
+        var, start, stop, points, path = args.plot_freq
+        instructions.append(
+            {
+                "var": var,
+                "start": float(start),
+                "stop": float(stop),
+                "points": int(points),
+                "path": Path(path),
+                "symbol": sp.symbols("w"),
+            }
+        )
+    return instructions
+
+
+def enrich_analysis(
+    summary: dict, label: str, args: argparse.Namespace, substitutions: dict
+) -> Tuple[dict, Dict[str, sp.Expr]]:
+    solutions: Dict[str, sp.Expr] = {}
+    plots: List[str] = []
+    extra_warnings: List[str] = []
+
+    if args.solve:
+        solutions = solve_equations(summary.get("raw_equations", []), substitutions)
+        if solutions:
+            summary["solutions"] = {k: str(sp.simplify(v)) for k, v in solutions.items()}
+        else:
+            extra_warnings.append(
+                "No se pudo resolver el sistema con los parámetros proporcionados."
+            )
+
+    for instruction in _plot_instructions(args):
+        var = instruction["var"]
+        if var not in solutions:
+            extra_warnings.append(
+                f"No se puede graficar {var} en {label} porque no hay solución calculada."
+            )
+            continue
+        try:
+            _plot_response(
+                solutions[var],
+                instruction["symbol"],
+                instruction["start"],
+                instruction["stop"],
+                instruction["points"],
+                instruction["path"],
+                var,
+            )
+            plots.append(str(instruction["path"]))
+        except Exception as exc:  # noqa: BLE001 - queremos mostrar el error al usuario
+            extra_warnings.append(f"Error al graficar {var} en {label}: {exc}")
+
+    if plots:
+        summary["plots"] = plots
+    if extra_warnings:
+        summary.setdefault("warnings", []).extend(extra_warnings)
+    return summary, solutions
+
+
 def run(args: argparse.Namespace) -> dict:
     mode = args.mode
     normalizer = UnitNormalizer()
     domain = args.domain
     method = args.method
+    try:
+        substitutions = parse_substitutions(args.substitute)
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from exc
 
     if args.csv:
         if mode == "single" and len(args.csv) != 1:
@@ -773,6 +1011,15 @@ def run(args: argparse.Namespace) -> dict:
         print_warnings(graph, "topología única")
         circuit = graph.to_lcapy_circuit()
         analysis_summary = symbolic_analysis(graph, domain, method, args.show_matrices)
+        analysis_summary, solutions = enrich_analysis(
+            analysis_summary, "single", args, substitutions
+        )
+        if args.export_csv:
+            export_to_csv(_labelled_path(args.export_csv, "single"), analysis_summary, solutions)
+        if args.export_latex:
+            export_to_latex(
+                _labelled_path(args.export_latex, "single"), analysis_summary, solutions
+            )
         print_symbolic("topología única", analysis_summary, method, args.show_matrices)
         if args.show_lcapy:
             print("\nNetlist lcapy:")
@@ -802,7 +1049,27 @@ def run(args: argparse.Namespace) -> dict:
     circuit_post = graph_post.to_lcapy_circuit()
     switched = SwitchedCircuit(circuit_pre, circuit_post)
     analysis_pre = symbolic_analysis(graph_pre, domain, method, args.show_matrices)
+    analysis_pre, solutions_pre = enrich_analysis(
+        analysis_pre, "pre", args, substitutions
+    )
     analysis_post = symbolic_analysis(graph_post, domain, method, args.show_matrices)
+    analysis_post, solutions_post = enrich_analysis(
+        analysis_post, "post", args, substitutions
+    )
+
+    if args.export_csv:
+        export_to_csv(_labelled_path(args.export_csv, "pre"), analysis_pre, solutions_pre)
+        export_to_csv(
+            _labelled_path(args.export_csv, "post"), analysis_post, solutions_post
+        )
+    if args.export_latex:
+        export_to_latex(
+            _labelled_path(args.export_latex, "pre"), analysis_pre, solutions_pre
+        )
+        export_to_latex(
+            _labelled_path(args.export_latex, "post"), analysis_post, solutions_post
+        )
+
     print_symbolic("topología t<0", analysis_pre, method, args.show_matrices)
     print_symbolic("topología t>0", analysis_post, method, args.show_matrices)
     if args.show_lcapy:
