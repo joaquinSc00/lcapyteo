@@ -632,6 +632,14 @@ def parse_falstad_netlist(
             )
 
         value = tokens[6]
+        initial_condition: Optional[str] = None
+        if comp_type == "C" and len(tokens) >= 9:
+            initial_condition = tokens[-2]
+        elif comp_type == "L" and len(tokens) >= 8:
+            initial_condition = tokens[-2]
+
+        if initial_condition is not None:
+            value = f"{value} ic={initial_condition}"
         component_entries.append((prefix, (node_a, node_b), value))
 
     if ground_coords:
@@ -731,6 +739,57 @@ def prompt_for_components(label: str, normalizer: UnitNormalizer) -> list:
         except ValueError as exc:
             print(f"Entrada no válida: {exc}")
     return components
+
+
+def _prompt_yes_no(message: str, default: bool = False) -> bool:
+    suffix = "[S/n]" if default else "[s/N]"
+    while True:
+        choice = input(f"{message} {suffix}: ").strip().lower()
+        if not choice:
+            return default
+        if choice in {"s", "si", "sí"}:
+            return True
+        if choice in {"n", "no"}:
+            return False
+        print("Responde con 's' o 'n'.")
+
+
+def prompt_topology_mode(current_mode: str) -> str:
+    wants_double = _prompt_yes_no(
+        "¿Trabajar con doble topología (t<0 y t>0)?",
+        default=current_mode == "double",
+    )
+    return "double" if wants_double else "single"
+
+
+def prompt_input_style() -> str:
+    print(
+        "\n¿Cómo introducir el circuito?\n"
+        "  1) Línea por línea (Tipo,Nombre,NodoA,NodoB,Valor[,Orientación])\n"
+        "  2) Pegar netlist completo de Falstad/CircuitJS\n"
+        "Pulsa Enter para usar la opción por defecto (1)."
+    )
+    while True:
+        choice = input("Selecciona 1 o 2 [1]: ").strip()
+        if choice in {"", "1"}:
+            return "line"
+        if choice == "2":
+            return "falstad"
+        print("Opción no válida. Elige 1 o 2.")
+
+
+def prompt_falstad_text() -> str:
+    print(
+        "Pega aquí el netlist exportado desde Falstad/CircuitJS.\n"
+        "Cuando termines, deja una línea vacía para finalizar."
+    )
+    lines: List[str] = []
+    while True:
+        line = input()
+        if not line.strip():
+            break
+        lines.append(line)
+    return "\n".join(lines)
 
 
 def _format_equations(equations: Sequence[sp.Eq]) -> List[str]:
@@ -1125,6 +1184,18 @@ def run(args: argparse.Namespace) -> dict:
     except ValueError as exc:
         raise SystemExit(str(exc)) from exc
 
+    interactive_entry: Optional[str] = None
+    interactive_falstad_text: Optional[str] = None
+    interactive_prompt = not args.csv and not args.falstad
+    if interactive_prompt:
+        mode = prompt_topology_mode(mode)
+        interactive_entry = prompt_input_style()
+        if mode == "double" and interactive_entry == "falstad":
+            print("\nLa carga de netlists de Falstad solo está disponible para una topología.")
+            interactive_entry = "line"
+        if interactive_entry == "falstad":
+            interactive_falstad_text = prompt_falstad_text()
+
     if args.falstad and args.csv:
         raise SystemExit("No combines --falstad con archivos CSV.")
 
@@ -1145,6 +1216,10 @@ def run(args: argparse.Namespace) -> dict:
             )
         except ValueError as exc:
             raise SystemExit(str(exc)) from exc
+    elif interactive_falstad_text:
+        components_from_falstad = parse_falstad_netlist(
+            interactive_falstad_text, normalizer
+        )
 
     if mode == "single":
         if components_from_falstad is not None:
