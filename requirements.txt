@@ -1,0 +1,5 @@
+lcapy
+sympy
+pint
+matplotlib
+numpy
