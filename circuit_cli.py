@@ -128,8 +128,12 @@ class CircuitGraph:
         self.implicit_nodes: Set[str] = set()
         self.duplicate_references: Set[str] = set()
         self.name_collisions: Set[str] = set()
+        self.warnings: List[str] = []
         self._build()
         self._validate()
+        self._detect_duplicate_nodes()
+        self._check_connectivity()
+        self._detect_wire_shorts()
 
     def _build(self) -> None:
         seen_names: Set[str] = set()
@@ -157,12 +161,136 @@ class CircuitGraph:
     def _validate(self) -> None:
         if self.name_collisions:
             collisions = ", ".join(sorted(self.name_collisions))
-            raise ValueError(f"Nombres de componente duplicados: {collisions}")
+            self.warnings.append(
+                "Nombres de componente duplicados: "
+                f"{collisions}. Usa identificadores únicos."
+            )
         if self.duplicate_references:
             duplicates = ", ".join(sorted(self.duplicate_references))
-            raise ValueError(
+            self.warnings.append(
                 "Se detectaron múltiples alias de referencia (por ejemplo '0' y 'gnd'): "
-                f"{duplicates}"
+                f"{duplicates}. Unifica todos los nodos de referencia con un único nombre."
+            )
+
+    def _detect_duplicate_nodes(self) -> None:
+        normalized_to_originals: Dict[str, Set[str]] = defaultdict(set)
+        for node in self.nodes:
+            normalized_to_originals[node.lower()].add(node)
+        duplicates = {
+            normalized: originals
+            for normalized, originals in normalized_to_originals.items()
+            if len(originals) > 1
+        }
+        if duplicates:
+            details = "; ".join(
+                f"{', '.join(sorted(values))}"
+                for values in duplicates.values()
+            )
+            self.warnings.append(
+                "Nodos con el mismo nombre pero distinta capitalización: "
+                f"{details}. Usa siempre la misma escritura para evitar cortos no deseados."
+            )
+
+    def _build_adjacency(self) -> Dict[str, Set[str]]:
+        adjacency: Dict[str, Set[str]] = defaultdict(set)
+        for component in self.components:
+            adjacency[component.node_a].add(component.node_b)
+            adjacency[component.node_b].add(component.node_a)
+        return adjacency
+
+    def _check_connectivity(self) -> None:
+        if not self.nodes:
+            return
+
+        adjacency = self._build_adjacency()
+        reference_candidates = {node for node in self.nodes if node.lower() in {"0", "gnd"}}
+        if self.implicit_nodes and "0" in self.nodes:
+            reference_candidates.add("0")
+
+        if not reference_candidates:
+            self.warnings.append(
+                "No se encontró nodo de referencia explícito. Se usará '0' de forma implícita."
+            )
+            reference_candidates.add("0")
+
+        visited: Set[str] = set()
+        stack = list(reference_candidates)
+        while stack:
+            current = stack.pop()
+            if current in visited:
+                continue
+            visited.add(current)
+            stack.extend(adjacency.get(current, set()) - visited)
+
+        floating_nodes = self.nodes - visited
+        if floating_nodes:
+            floating_components = [
+                comp
+                for comp in self.components
+                if comp.node_a in floating_nodes and comp.node_b in floating_nodes
+            ]
+            nodes_str = ", ".join(sorted(floating_nodes))
+            comps_str = ", ".join(sorted({comp.name for comp in floating_components}))
+            suggestion = (
+                "Conecta estos nodos al nodo de referencia o revisa si faltan etiquetas "
+                "consistentes."
+            )
+            if comps_str:
+                suggestion += f" Componentes afectados: {comps_str}."
+            self.warnings.append(
+                f"Nodos sin camino al nodo de referencia: {nodes_str}. {suggestion}"
+            )
+
+    def _is_wire_like(self, component: ComponentSpec) -> bool:
+        if component.type == "W":
+            return True
+        if component.type != "R":
+            return False
+        try:
+            quantity = component.normalizer.unit_registry(component.value)
+            if quantity.dimensionless:
+                default_unit = component.normalizer.default_units.get(component.type)
+                if default_unit:
+                    quantity = quantity * component.normalizer.unit_registry(default_unit)
+            return quantity.magnitude == 0
+        except Exception:
+            return False
+
+    def _detect_wire_shorts(self) -> None:
+        wire_components = [comp for comp in self.components if self._is_wire_like(comp)]
+        if not wire_components:
+            return
+
+        adjacency: Dict[str, Set[str]] = defaultdict(set)
+        for comp in wire_components:
+            adjacency[comp.node_a].add(comp.node_b)
+            adjacency[comp.node_b].add(comp.node_a)
+
+        visited: Set[str] = set()
+        shorts: List[Set[str]] = []
+        for node in adjacency:
+            if node in visited:
+                continue
+            stack = [node]
+            component_nodes: Set[str] = set()
+            while stack:
+                current = stack.pop()
+                if current in visited:
+                    continue
+                visited.add(current)
+                component_nodes.add(current)
+                stack.extend(adjacency[current] - visited)
+            if len(component_nodes) > 1:
+                shorts.append(component_nodes)
+
+        if shorts:
+            shorts_str = "; ".join(
+                ", ".join(sorted(short_nodes)) for short_nodes in shorts
+            )
+            self.warnings.append(
+                "Posible corto accidental: los nodos "
+                f"{shorts_str} están unidos solo por alambres/0Ω. "
+                "Verifica que deban ser el mismo nodo o elimina el puente."
             )
 
     def to_lcapy_circuit(self) -> Circuit:
@@ -284,7 +412,16 @@ def summarize_graph(graph: CircuitGraph, label: str) -> Dict[str, Iterable[str]]
     return {
         f"implicit_nodes_{label}": sorted(graph.implicit_nodes),
         f"duplicate_references_{label}": sorted(graph.duplicate_references),
+        f"warnings_{label}": graph.warnings,
     }
+
+
+def print_warnings(graph: CircuitGraph, label: str) -> None:
+    if not graph.warnings:
+        return
+    print(f"\n⚠️  Advertencias para {label}:")
+    for warning in graph.warnings:
+        print(f" - {warning}")
 
 
 def run(args: argparse.Namespace) -> dict:
@@ -303,6 +440,7 @@ def run(args: argparse.Namespace) -> dict:
         else:
             components = prompt_for_components("todo t<0/t>0", normalizer)
         graph = CircuitGraph(components)
+        print_warnings(graph, "topología única")
         circuit = graph.to_lcapy_circuit()
         result = {
             "mode": mode,
@@ -322,6 +460,8 @@ def run(args: argparse.Namespace) -> dict:
 
     graph_pre = CircuitGraph(components_pre)
     graph_post = CircuitGraph(components_post)
+    print_warnings(graph_pre, "topología t<0")
+    print_warnings(graph_post, "topología t>0")
     circuit_pre = graph_pre.to_lcapy_circuit()
     circuit_post = graph_post.to_lcapy_circuit()
     switched = SwitchedCircuit(circuit_pre, circuit_post)
