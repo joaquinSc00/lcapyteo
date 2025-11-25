@@ -559,6 +559,129 @@ def mesh_equations(graph: CircuitGraph, domain: str) -> Tuple[list, List[str]]:
     return equations, sorted(set(warnings))
 
 
+def parse_falstad_netlist(
+    text: str, normalizer: UnitNormalizer
+) -> List[ComponentSpec]:
+    mapping = {
+        "r": "R",
+        "c": "C",
+        "l": "L",
+        "v": "V",
+        "i": "I",
+        "d": "D",
+        "e": "E",
+        "f": "F",
+        "g": None,
+        "h": "H",
+        "k": "K",
+        "w": None,
+    }
+
+    def coord_key(x: str, y: str) -> str:
+        return f"{int(float(x))},{int(float(y))}"
+
+    parents: Dict[str, str] = {}
+    ground_coords: Set[str] = set()
+    component_entries: List[Tuple[str, Tuple[str, str], str]] = []
+
+    def find(item: str) -> str:
+        parents.setdefault(item, item)
+        if parents[item] != item:
+            parents[item] = find(parents[item])
+        return parents[item]
+
+    def union(a: str, b: str) -> None:
+        root_a, root_b = find(a), find(b)
+        if root_a != root_b:
+            parents[root_b] = root_a
+
+    lines = [line.strip() for line in text.strip().splitlines() if line.strip()]
+    if not lines:
+        raise ValueError("El netlist de Falstad no puede estar vacío.")
+
+    for idx, line in enumerate(lines, start=1):
+        if line.startswith("$"):
+            continue
+        tokens = line.split()
+        if len(tokens) < 5:
+            raise ValueError(
+                f"Línea {idx} inválida en netlist Falstad: '{line}'."
+            )
+
+        prefix = tokens[0].lower()
+        if prefix not in mapping:
+            raise ValueError(f"Prefijo desconocido en Falstad: '{prefix}'.")
+
+        node_a = coord_key(tokens[1], tokens[2])
+        node_b = coord_key(tokens[3], tokens[4])
+        find(node_a)
+        find(node_b)
+
+        if prefix == "w":
+            union(node_a, node_b)
+            continue
+
+        if prefix == "g":
+            ground_coords.update({node_a, node_b})
+            union(node_a, node_b)
+            continue
+
+        if len(tokens) < 7:
+            raise ValueError(
+                f"Valor numérico faltante en línea {idx} del netlist Falstad."
+            )
+
+        value = tokens[6]
+        component_entries.append((prefix, (node_a, node_b), value))
+
+    if ground_coords:
+        ground_roots = {find(coord) for coord in ground_coords}
+        primary_ground = next(iter(ground_roots))
+        for root in ground_roots:
+            union(primary_ground, root)
+
+    node_names: Dict[str, str] = {}
+    root_to_name: Dict[str, str] = {}
+    ground_root = find(next(iter(ground_coords))) if ground_coords else None
+    counter = 1
+    for coord in sorted(parents):
+        root = find(coord)
+        if root not in root_to_name:
+            if ground_root and root == ground_root:
+                root_to_name[root] = "0"
+            else:
+                root_to_name[root] = f"n{counter}"
+                counter += 1
+        node_names[coord] = root_to_name[root]
+
+    type_counters: Dict[str, int] = defaultdict(int)
+    components: List[ComponentSpec] = []
+    for prefix, (node_a, node_b), value in component_entries:
+        comp_type = mapping[prefix]
+        if comp_type is None:
+            continue
+        type_counters[comp_type] += 1
+        name = f"{comp_type}{type_counters[comp_type]}"
+        resolved_a = node_names[node_a]
+        resolved_b = node_names[node_b]
+        if resolved_a == resolved_b:
+            raise ValueError(
+                f"El componente {name} conecta el mismo nodo ({resolved_a}). Revisa las coordenadas."
+            )
+        components.append(
+            ComponentSpec(
+                type=comp_type,
+                name=name,
+                node_a=resolved_a,
+                node_b=resolved_b,
+                value=value,
+                normalizer=normalizer,
+            )
+        )
+
+    return components
+
+
 def parse_component_line(line: str, normalizer: UnitNormalizer) -> ComponentSpec:
     parts = [piece.strip() for piece in line.split(",") if piece.strip()]
     if len(parts) not in (5, 6):
@@ -810,6 +933,12 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--falstad",
+        help=(
+            "Pega un netlist exportado desde Falstad/CircuitJS. Solo se admite en modo single."
+        ),
+    )
+    parser.add_argument(
         "--method",
         choices=["nodal", "mesh"],
         default="nodal",
@@ -996,14 +1125,31 @@ def run(args: argparse.Namespace) -> dict:
     except ValueError as exc:
         raise SystemExit(str(exc)) from exc
 
+    if args.falstad and args.csv:
+        raise SystemExit("No combines --falstad con archivos CSV.")
+
+    if args.falstad and args.mode == "double":
+        raise SystemExit("--falstad solo está disponible en modo single.")
+
     if args.csv:
         if mode == "single" and len(args.csv) != 1:
             raise SystemExit("Modo single requiere exactamente un archivo CSV.")
         if mode == "double" and len(args.csv) != 2:
             raise SystemExit("Modo double requiere dos archivos CSV: t<0 y t>0.")
 
+    components_from_falstad: Optional[List[ComponentSpec]] = None
+    if args.falstad:
+        try:
+            components_from_falstad = parse_falstad_netlist(
+                args.falstad, normalizer
+            )
+        except ValueError as exc:
+            raise SystemExit(str(exc)) from exc
+
     if mode == "single":
-        if args.csv:
+        if components_from_falstad is not None:
+            components = components_from_falstad
+        elif args.csv:
             components = load_components_from_csv(args.csv[0], normalizer)
         else:
             components = prompt_for_components("todo t<0/t>0", normalizer)
