@@ -612,6 +612,8 @@ def parse_falstad_netlist(
         if prefix not in mapping:
             raise ValueError(f"Prefijo desconocido en Falstad: '{prefix}'.")
 
+        comp_type = mapping[prefix]
+
         node_a = coord_key(tokens[1], tokens[2])
         node_b = coord_key(tokens[3], tokens[4])
         find(node_a)
