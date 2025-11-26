@@ -88,3 +88,26 @@ def test_parse_falstad_netlist_builds_expected_topology():
     graph = CircuitGraph(components)
     assert graph.nodes == {"n1", "n2", "0"}
     assert not graph.warnings
+
+
+def test_normalize_value_preserves_initial_condition_suffix():
+    normalizer = UnitNormalizer()
+
+    normalized = normalizer.normalize_value("1 ic=0.5", "L")
+
+    assert normalized == "1H ic=0.5"
+
+
+def test_falstad_netlist_with_initial_condition_parses_successfully():
+    normalizer = UnitNormalizer()
+    falstad_text = """
+    $ 1 0.000005 10.20027730826997 50 5 50
+    l 0 0 0 64 0 1 1 0.25 0
+    g 0 0 0 16 0
+    """
+
+    components = parse_falstad_netlist(falstad_text, normalizer)
+
+    assert any(comp.value.endswith("ic=0.25") for comp in components if comp.type == "L")
+    inductor = next(comp for comp in components if comp.type == "L")
+    assert inductor.netlist_line().endswith("ic=0.25")
