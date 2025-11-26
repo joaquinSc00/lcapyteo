@@ -1108,6 +1108,22 @@ def build_parser() -> argparse.ArgumentParser:
         metavar=("VAR", "W0", "W1", "POINTS", "FILE"),
         help="Graficar una solución en frecuencia (variable, w0, w1, muestras, archivo).",
     )
+    parser.add_argument(
+        "--query",
+        nargs="+",
+        metavar="VAR",
+        help=(
+            "Variables de interés a mostrar (por ejemplo, corrientes o tensiones de componentes)."
+        ),
+    )
+    parser.add_argument(
+        "--query-time",
+        choices=["pre", "post"],
+        help=(
+            "En modo double, indica si la consulta aplica a t<0 (pre) o t>0 (post). "
+            "Si no se indica y se usa --query, se pedirá de forma interactiva."
+        ),
+    )
     return parser
 
 
@@ -1201,7 +1217,11 @@ def _sanitize_for_json(obj):
 
 
 def enrich_analysis(
-    summary: dict, label: str, args: argparse.Namespace, substitutions: dict
+    summary: dict,
+    label: str,
+    args: argparse.Namespace,
+    substitutions: dict,
+    requested_vars: Optional[Set[str]] = None,
 ) -> Tuple[dict, Dict[str, sp.Expr]]:
     solutions: Dict[str, sp.Expr] = {}
     plots: List[str] = []
@@ -1209,17 +1229,35 @@ def enrich_analysis(
 
     equations = summary.get("_sympy_equations", [])
 
+    requested = None if requested_vars is None else set(requested_vars)
+
     if args.solve:
-        solutions = solve_equations(equations, substitutions)
+        solved = solve_equations(equations, substitutions)
+        missing_vars: Set[str] = set()
+        if requested is None:
+            solutions = solved
+        else:
+            solutions = {name: expr for name, expr in solved.items() if name in requested}
+            missing_vars = requested - set(solved)
+
         if solutions:
             summary["solutions"] = {k: str(sp.simplify(v)) for k, v in solutions.items()}
-        else:
+        if missing_vars:
+            extra_warnings.append(
+                "No se encontraron soluciones para: " + ", ".join(sorted(missing_vars))
+            )
+        if not solved:
             extra_warnings.append(
                 "No se pudo resolver el sistema con los parámetros proporcionados."
             )
 
     for instruction in _plot_instructions(args):
         var = instruction["var"]
+        if requested is not None and var not in requested:
+            extra_warnings.append(
+                f"Se omitió la gráfica de {var} en {label} porque no está en la lista de consulta."
+            )
+            continue
         if var not in solutions:
             extra_warnings.append(
                 f"No se puede graficar {var} en {label} porque no hay solución calculada."
@@ -1258,6 +1296,7 @@ def run(args: argparse.Namespace) -> dict:
 
     interactive_entry: Optional[str] = None
     interactive_falstad_text: Optional[str] = None
+    interactive_queries: Optional[List[str]] = None
     interactive_prompt = not args.csv and not args.falstad
     if interactive_prompt:
         mode = prompt_topology_mode(mode)
@@ -1267,6 +1306,12 @@ def run(args: argparse.Namespace) -> dict:
             interactive_entry = "line"
         if interactive_entry == "falstad":
             interactive_falstad_text = prompt_falstad_text()
+        query_input = input(
+            "\nIntroduce las variables que deseas consultar (separadas por espacio). "
+            "Deja vacío para ver todas: "
+        ).strip()
+        if query_input:
+            interactive_queries = query_input.split()
 
     if args.falstad and args.csv:
         raise SystemExit("No combines --falstad con archivos CSV.")
@@ -1293,6 +1338,23 @@ def run(args: argparse.Namespace) -> dict:
             interactive_falstad_text, normalizer
         )
 
+    query_vars: Optional[List[str]] = args.query or interactive_queries
+    requested_set: Optional[Set[str]] = None
+    query_time: Optional[str] = args.query_time
+
+    if query_vars:
+        requested_set = set(query_vars)
+        if mode == "double" and not query_time:
+            if interactive_prompt:
+                while query_time not in {"pre", "post"}:
+                    query_time = input(
+                        "¿La consulta corresponde a t<0 (pre) o t>0 (post)? [pre/post]: "
+                    ).strip().lower()
+            else:
+                raise SystemExit(
+                    "En modo double usa --query-time pre|post para indicar si la consulta es para t<0 o t>0."
+                )
+
     if mode == "single":
         if components_from_falstad is not None:
             components = components_from_falstad
@@ -1305,7 +1367,7 @@ def run(args: argparse.Namespace) -> dict:
         circuit = graph.to_lcapy_circuit()
         analysis_summary = symbolic_analysis(graph, domain, method, args.show_matrices)
         analysis_summary, solutions = enrich_analysis(
-            analysis_summary, "single", args, substitutions
+            analysis_summary, "single", args, substitutions, requested_set
         )
         if args.export_csv:
             export_to_csv(_labelled_path(args.export_csv, "single"), analysis_summary, solutions)
@@ -1343,11 +1405,19 @@ def run(args: argparse.Namespace) -> dict:
     switched = SwitchedCircuit(circuit_pre, circuit_post)
     analysis_pre = symbolic_analysis(graph_pre, domain, method, args.show_matrices)
     analysis_pre, solutions_pre = enrich_analysis(
-        analysis_pre, "pre", args, substitutions
+        analysis_pre,
+        "pre",
+        args,
+        substitutions,
+        requested_set if query_time == "pre" else (set() if requested_set else None),
     )
     analysis_post = symbolic_analysis(graph_post, domain, method, args.show_matrices)
     analysis_post, solutions_post = enrich_analysis(
-        analysis_post, "post", args, substitutions
+        analysis_post,
+        "post",
+        args,
+        substitutions,
+        requested_set if query_time == "post" else (set() if requested_set else None),
     )
 
     if args.export_csv:
