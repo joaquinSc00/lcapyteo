@@ -47,8 +47,20 @@ class UnitNormalizer:
         self.unit_registry = unit_registry or UnitRegistry(auto_reduce_dimensions=True)
         self.default_units = default_units or DEFAULT_UNITS
 
-    def normalize_value(self, value: str, component_type: str) -> str:
+    @staticmethod
+    def _split_initial_condition(value: str) -> Tuple[str, str]:
         value = value.strip()
+        lower = value.lower()
+        ic_index = lower.find("ic=")
+        if ic_index == -1:
+            return value, ""
+
+        base_value = value[:ic_index].strip()
+        ic_suffix = value[ic_index:].strip()
+        return base_value, ic_suffix
+
+    def normalize_value(self, value: str, component_type: str) -> str:
+        value, ic_suffix = self._split_initial_condition(value)
         if not value:
             raise ValueError("El valor numérico no puede estar vacío.")
 
@@ -64,13 +76,15 @@ class UnitNormalizer:
         quantity = quantity.to_compact()
         magnitude = f"{quantity.magnitude:g}"
         if quantity.units == self.unit_registry.dimensionless:
-            return magnitude
+            normalized = magnitude
+        else:
+            unit_str = f"{quantity.units:~}"
+            normalized = f"{magnitude}{unit_str}"
 
-        unit_str = f"{quantity.units:~}"
-        return f"{magnitude}{unit_str}"
+        return f"{normalized} {ic_suffix}".strip() if ic_suffix else normalized
 
     def magnitude_in_base_units(self, value: str, component_type: str) -> float:
-        value = value.strip()
+        value, _ = self._split_initial_condition(value)
         if not value:
             raise ValueError("El valor numérico no puede estar vacío.")
 
@@ -125,11 +139,14 @@ class ComponentSpec:
         return self.normalizer.normalize_value(self.value, self.type)
 
     def netlist_line(self) -> str:
+        base_value, ic_suffix = self.normalizer._split_initial_condition(self.value)
         try:
             magnitude = self.normalizer.magnitude_in_base_units(
-                self.value, self.type
+                base_value, self.type
             )
             value_token = f"{magnitude:g}"
+            if ic_suffix:
+                value_token = f"{value_token} {ic_suffix}"
         except Exception:
             value_token = self.normalized_value
         return f"{self.name} {self.node_a} {self.node_b} {value_token}"
