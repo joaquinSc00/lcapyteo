@@ -8,6 +8,9 @@ from circuit_cli import (  # noqa: E402
     CircuitGraph,
     ComponentSpec,
     UnitNormalizer,
+    _format_equations,
+    export_to_csv,
+    export_to_latex,
     nodal_equations,
     parse_falstad_netlist,
     parse_substitutions,
@@ -57,6 +60,37 @@ def test_wheatstone_bridge_balanced_nodes_match():
     equations, _ = nodal_equations(graph, "laplace")
     solutions = solve_equations(equations)
     assert sp.simplify(solutions["V_n1"] - solutions["V_n2"]) == 0
+
+
+def test_format_equations_returns_pretty_and_latex():
+    s = sp.symbols("s")
+    equation = sp.Eq(sp.symbols("V_out"), 1 / (s + 1))
+
+    formatted = _format_equations([equation])
+
+    assert formatted[0]["plain"] == "V_out = 1/(s + 1)"
+    assert formatted[0]["latex"] == "V_{out} = \\frac{1}{s + 1}"
+    assert " = " in formatted[0]["pretty"].splitlines()[0]
+
+
+def test_export_functions_handle_formatted_equations(tmp_path):
+    equation = sp.Eq(sp.symbols("V_out"), sp.symbols("V_in"))
+    summary = {"equations": _format_equations([equation])}
+    solution = {"V_out": sp.symbols("V_in")}
+
+    csv_path = tmp_path / "summary.csv"
+    latex_path = tmp_path / "summary.tex"
+
+    export_to_csv(csv_path, summary, solution)
+    export_to_latex(latex_path, summary, solution)
+
+    csv_content = csv_path.read_text()
+    latex_content = latex_path.read_text()
+    equation_plain = summary["equations"][0]["plain"]
+    equation_latex = summary["equations"][0]["latex"]
+
+    assert f"ecuacion,{equation_plain}" in csv_content
+    assert f"$${equation_latex}$$" in latex_content
 
 
 def test_substitutions_parse_numeric_values():

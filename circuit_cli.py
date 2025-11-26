@@ -811,11 +811,40 @@ def prompt_falstad_text() -> str:
     return "\n".join(lines)
 
 
-def _format_equations(equations: Sequence[sp.Eq]) -> List[str]:
+def _align_pretty(lhs: str, rhs: str) -> str:
+    lhs_lines = lhs.splitlines() or [""]
+    rhs_lines = rhs.splitlines() or [""]
+    lhs_width = max(len(line) for line in lhs_lines)
+    total_lines = max(len(lhs_lines), len(rhs_lines))
+    lhs_lines += [""] * (total_lines - len(lhs_lines))
+    rhs_lines += [""] * (total_lines - len(rhs_lines))
+    aligned = [f"{lhs_lines[i].ljust(lhs_width)} = {rhs_lines[i]}" for i in range(total_lines)]
+    return "\n".join(aligned)
+
+
+def _format_equations(equations: Sequence[sp.Eq]) -> List[Dict[str, str]]:
     formatted = []
     for eq in equations:
-        formatted.append(str(sp.simplify(eq)))
+        simplified = sp.simplify(eq)
+        plain = f"{simplified.lhs} = {simplified.rhs}"
+        pretty = _align_pretty(
+            sp.pretty(simplified.lhs, use_unicode=False),
+            sp.pretty(simplified.rhs, use_unicode=False),
+        )
+        latex = sp.latex(simplified)
+        formatted.append({"plain": plain, "pretty": pretty, "latex": latex})
     return formatted
+
+
+def _equation_repr(equation, style: str = "plain") -> str:
+    if isinstance(equation, dict):
+        return equation.get(style) or equation.get("plain", "")
+    if style == "latex":
+        try:
+            return sp.latex(sp.sympify(equation))
+        except Exception:  # noqa: BLE001 - usamos string como último recurso
+            return str(equation)
+    return str(equation)
 
 
 def _matrix_from_equations(equations: Sequence[sp.Eq]) -> Tuple[sp.Matrix, sp.Matrix, list]:
@@ -890,7 +919,7 @@ def export_to_csv(path: str, summary: dict, solution: Dict[str, sp.Expr]) -> Non
         writer = csv.writer(csvfile)
         writer.writerow(["Tipo", "Contenido"])
         for equation in summary.get("equations", []):
-            writer.writerow(["ecuacion", equation])
+            writer.writerow(["ecuacion", _equation_repr(equation, "plain")])
         for warning in summary.get("warnings", []):
             writer.writerow(["advertencia", warning])
         for var, expr in solution.items():
@@ -904,7 +933,10 @@ def export_to_latex(path: str, summary: dict, solution: Dict[str, sp.Expr]) -> N
     if summary.get("equations"):
         lines.append("\\subsection*{Ecuaciones}")
         for equation in summary["equations"]:
-            lines.append(f"$${sp.latex(sp.sympify(equation))}$$")
+            latex_expr = _equation_repr(equation, "latex")
+            if latex_expr == "":
+                latex_expr = sp.latex(sp.sympify(equation))
+            lines.append(f"$${latex_expr}$$")
     if summary.get("warnings"):
         lines.append("\\subsection*{Advertencias}")
         for warning in summary["warnings"]:
@@ -1098,7 +1130,7 @@ def print_warnings(graph: CircuitGraph, label: str) -> None:
 def print_symbolic(label: str, summary: dict, method: str, show_matrices: bool) -> None:
     print(f"\nEcuaciones simbólicas ({method}) para {label}:")
     for eq in summary.get("equations", []):
-        print(f" - {eq}")
+        print(textwrap.indent(_equation_repr(eq, "pretty"), " - "))
 
     for warning in summary.get("warnings", []):
         print(f" ⚠️  {warning}")
