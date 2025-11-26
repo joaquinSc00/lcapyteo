@@ -951,7 +951,8 @@ def symbolic_analysis(graph: CircuitGraph, domain: str, method: str, show_matric
 
     summary = {
         "equations": _format_equations(equations),
-        "raw_equations": equations,
+        "raw_equations": [str(eq) for eq in equations],
+        "_sympy_equations": equations,
     }
     if warnings:
         summary["warnings"] = warnings
@@ -1149,6 +1150,24 @@ def _plot_instructions(args: argparse.Namespace) -> List[dict]:
     return instructions
 
 
+def _sanitize_for_json(obj):
+    if isinstance(obj, dict):
+        return {
+            key: _sanitize_for_json(value)
+            for key, value in obj.items()
+            if not key.startswith("_")
+        }
+    if isinstance(obj, (list, tuple, set)):
+        return [_sanitize_for_json(item) for item in obj]
+    if isinstance(obj, Path):
+        return str(obj)
+    if isinstance(obj, sp.MatrixBase):
+        return [[_sanitize_for_json(item) for item in row] for row in obj.tolist()]
+    if isinstance(obj, sp.Basic):
+        return str(obj)
+    return obj
+
+
 def enrich_analysis(
     summary: dict, label: str, args: argparse.Namespace, substitutions: dict
 ) -> Tuple[dict, Dict[str, sp.Expr]]:
@@ -1156,8 +1175,10 @@ def enrich_analysis(
     plots: List[str] = []
     extra_warnings: List[str] = []
 
+    equations = summary.get("_sympy_equations", [])
+
     if args.solve:
-        solutions = solve_equations(summary.get("raw_equations", []), substitutions)
+        solutions = solve_equations(equations, substitutions)
         if solutions:
             summary["solutions"] = {k: str(sp.simplify(v)) for k, v in solutions.items()}
         else:
@@ -1338,7 +1359,7 @@ def main():
     args = parser.parse_args()
     payload = run(args)
     print("\nResumen (JSON):")
-    print(json.dumps(payload, indent=2, ensure_ascii=False))
+    print(json.dumps(_sanitize_for_json(payload), indent=2, ensure_ascii=False))
 
 
 if __name__ == "__main__":
