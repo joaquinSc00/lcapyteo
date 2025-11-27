@@ -411,6 +411,16 @@ class SwitchedCircuit:
         return self.circuit_pre if time < 0 else self.circuit_post
 
 
+@dataclass
+class TopologyContext:
+    label: str
+    components: List[ComponentSpec]
+    graph: CircuitGraph
+    entry: SessionEntry
+    last_analysis: Optional[dict] = None
+    last_solutions: Optional[Dict[str, sp.Expr]] = None
+
+
 def _domain_operator(domain: str) -> sp.Expr:
     if domain == "laplace":
         return sp.symbols("s")
@@ -441,6 +451,84 @@ def _circuit_for_domain(entry: SessionEntry, domain: str) -> Circuit:
     if domain == "time" and entry.circuit_dc is not None:
         return entry.circuit_dc
     return entry.circuit
+
+
+def _build_topology_context(
+    label: str, components: List[ComponentSpec], domain: str
+) -> TopologyContext:
+    graph = CircuitGraph(components)
+    print_warnings(graph, label)
+    circuit = graph.to_lcapy_circuit()
+    entry = SESSION.store(label, circuit, domain)
+    return TopologyContext(label, components, graph, entry)
+
+
+def _select_topology(contexts: Dict[str, TopologyContext]) -> TopologyContext:
+    if len(contexts) == 1:
+        return next(iter(contexts.values()))
+    labels = ", ".join(contexts)
+    while True:
+        choice = input(f"Elige topología [{labels}]: ").strip()
+        if choice in contexts:
+            return contexts[choice]
+        print("Topología no reconocida.")
+
+
+def _inverse_laplace_solutions(solutions: Dict[str, sp.Expr]) -> Dict[str, sp.Expr]:
+    if not solutions:
+        return {}
+    s_symbol = sp.symbols("s")
+    t_symbol = sp.symbols("t")
+    time_domain: Dict[str, sp.Expr] = {}
+    for name, expr in solutions.items():
+        try:
+            time_domain[name] = sp.inverse_laplace_transform(expr, s_symbol, t_symbol)
+        except Exception:
+            continue
+    return time_domain
+
+
+def _menu_args(solve: bool, to_time: bool) -> argparse.Namespace:
+    return argparse.Namespace(
+        solve=solve,
+        plot_time=None,
+        plot_freq=None,
+        solution_time=to_time,
+        solution_simplify=True,
+        solution_factor=False,
+        solution_collect=None,
+        lcapy_solve=None,
+        solution_vars=None,
+    )
+
+
+def _analyze_topology(
+    context: TopologyContext,
+    domain: str,
+    method: str,
+    solve: bool = False,
+    show_matrices: bool = False,
+    to_time: bool = False,
+) -> Tuple[dict, Dict[str, sp.Expr]]:
+    args = _menu_args(solve, to_time)
+    circuit_variant = _circuit_for_domain(context.entry, domain)
+    summary = symbolic_analysis(
+        context.graph, domain, method, show_matrices, circuit_variant
+    )
+    _inject_lcapy_solutions(summary, circuit_variant, args, None)
+    summary, solutions = enrich_analysis(summary, context.label, args, {}, None)
+
+    if to_time and domain == "laplace":
+        time_domain = _inverse_laplace_solutions(solutions)
+        if time_domain:
+            summary["time_domain_solutions"] = {
+                name: str(sp.simplify(expr)) for name, expr in time_domain.items()
+            }
+
+    context.last_analysis = summary
+    context.last_solutions = solutions
+    SESSION.active_domain = domain
+    return summary, solutions
 
 
 def _numeric_value(component: ComponentSpec) -> sp.Expr:
@@ -951,6 +1039,45 @@ def prompt_falstad_text() -> str:
             break
         lines.append(line)
     return "\n".join(lines)
+
+
+def _prompt_domain(current: str) -> str:
+    options = {
+        "1": "laplace",
+        "2": "jw",
+        "3": "time",
+    }
+    print(
+        "\nSelecciona dominio para el análisis:\n"
+        "  1) Laplace (s)\n"
+        "  2) AC (jω)\n"
+        "  3) Tiempo (derivadas)\n"
+        f"Pulsa Enter para mantener '{current}'."
+    )
+    while True:
+        choice = input("Dominio [1/2/3]: ").strip()
+        if not choice:
+            return current
+        if choice in options:
+            return options[choice]
+        print("Opción no válida, elige 1, 2 o 3.")
+
+
+def _prompt_method(current: str) -> str:
+    options = {"1": "nodal", "2": "mesh"}
+    print(
+        "\nMétodo de análisis:\n"
+        "  1) Nodal\n"
+        "  2) Mallas (KVL)\n"
+        f"Pulsa Enter para mantener '{current}'."
+    )
+    while True:
+        choice = input("Método [1/2]: ").strip()
+        if not choice:
+            return current
+        if choice in options:
+            return options[choice]
+        print("Selecciona 1 o 2.")
 
 
 def _align_pretty(lhs: str, rhs: str) -> str:
@@ -1632,6 +1759,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="Dominio simbólico para impedancias: s, jω o derivadas en el tiempo.",
     )
     parser.add_argument(
+        "--menu",
+        action="store_true",
+        help="Inicia un menú interactivo persistente tras cargar el circuito.",
+    )
+    parser.add_argument(
         "--show-matrices",
         action="store_true",
         help="Mostrar matrices G y B (linealizadas) además de las ecuaciones simbólicas.",
@@ -1797,6 +1929,11 @@ def print_symbolic(label: str, summary: dict, method: str, show_matrices: bool) 
         print("\nSoluciones:")
         for var, expr in summary["solutions"].items():
             print(f" {var} = {expr}")
+
+    if summary.get("time_domain_solutions"):
+        print("\nSoluciones en el tiempo:")
+        for var, expr in summary["time_domain_solutions"].items():
+            print(f" {var}(t) = {expr}")
 
     if summary.get("lcapy_solutions"):
         print("\nSoluciones (Lcapy):")
@@ -1969,6 +2106,140 @@ def enrich_analysis(
     if extra_warnings:
         summary.setdefault("warnings", []).extend(extra_warnings)
     return summary, solutions
+
+
+def _collect_components(label: str, style: str, normalizer: UnitNormalizer) -> List[ComponentSpec]:
+    if style == "falstad":
+        text = prompt_falstad_text()
+        return parse_falstad_netlist(text, normalizer)
+    return prompt_for_components(label, normalizer)
+
+
+def _load_interactive_topology(domain: str) -> Dict[str, TopologyContext]:
+    SESSION.reset()
+    normalizer = UnitNormalizer()
+    mode = prompt_topology_mode("single")
+    input_style = prompt_input_style()
+    if mode == "double" and input_style == "falstad":
+        print(
+            "\nLa carga de netlists de Falstad solo está disponible para una topología."
+            " Se usará entrada línea por línea."
+        )
+        input_style = "line"
+
+    contexts: Dict[str, TopologyContext] = {}
+    if mode == "single":
+        components = _collect_components("topología única", input_style, normalizer)
+        contexts["single"] = _build_topology_context("single", components, domain)
+    else:
+        components_pre = _collect_components("topología t<0", "line", normalizer)
+        components_post = _collect_components("topología t>0", "line", normalizer)
+        contexts["pre"] = _build_topology_context("pre", components_pre, domain)
+        contexts["post"] = _build_topology_context("post", components_post, domain)
+
+    print_session_summary()
+    return contexts
+
+
+def _print_components(contexts: Dict[str, TopologyContext]) -> None:
+    for label, context in contexts.items():
+        print(f"\nComponentes para {label}:")
+        for component in context.components:
+            print(f" - {component.netlist_line()}")
+        if not context.components:
+            print(" (sin componentes)")
+
+
+def _export_analysis(
+    context: TopologyContext,
+    domain: str,
+    method: str,
+    summary: Optional[dict],
+    solutions: Optional[Dict[str, sp.Expr]],
+) -> None:
+    if summary is None or solutions is None:
+        summary, solutions = _analyze_topology(
+            context, domain, method, solve=True, show_matrices=True
+        )
+    csv_path = input("Ruta de exportación CSV (vacío para omitir): ").strip()
+    latex_path = input("Ruta de exportación LaTeX (vacío para omitir): ").strip()
+    if csv_path:
+        export_to_csv(Path(csv_path), summary, solutions)
+        print(f"Resumen CSV guardado en {csv_path}")
+    if latex_path:
+        export_to_latex(Path(latex_path), summary, solutions)
+        print(f"Resumen LaTeX guardado en {latex_path}")
+
+
+def interactive_menu(default_domain: str, default_method: str) -> None:
+    contexts = _load_interactive_topology(default_domain)
+    current_domain = default_domain
+    current_method = default_method
+
+    while True:
+        print(
+            "\n=== Menú de análisis ===\n"
+            "1) Ver componentes cargados\n"
+            "2) Mostrar ecuaciones (malla/nudo)\n"
+            "3) Mostrar matriz A·y=b\n"
+            "4) Resolver en DC/AC/Laplace\n"
+            "5) Obtener i(t)/v(t) en el dominio del tiempo\n"
+            "6) Exportar resultados\n"
+            "7) Cargar nuevo circuito\n"
+            "8) Salir"
+        )
+        choice = input("Selecciona una opción: ").strip()
+
+        if choice == "1":
+            _print_components(contexts)
+        elif choice == "2":
+            current_method = _prompt_method(current_method)
+            context = _select_topology(contexts)
+            summary, _ = _analyze_topology(
+                context, current_domain, current_method, solve=False
+            )
+            print_symbolic(context.label, summary, current_method, False)
+        elif choice == "3":
+            current_method = _prompt_method(current_method)
+            context = _select_topology(contexts)
+            summary, _ = _analyze_topology(
+                context, current_domain, current_method, show_matrices=True
+            )
+            print_symbolic(context.label, summary, current_method, True)
+        elif choice == "4":
+            current_domain = _prompt_domain(current_domain)
+            context = _select_topology(contexts)
+            summary, _ = _analyze_topology(
+                context, current_domain, current_method, solve=True
+            )
+            print_symbolic(context.label, summary, current_method, False)
+        elif choice == "5":
+            current_domain = _prompt_domain(current_domain)
+            context = _select_topology(contexts)
+            summary, _ = _analyze_topology(
+                context,
+                current_domain,
+                current_method,
+                solve=True,
+                to_time=True,
+            )
+            print_symbolic(context.label, summary, current_method, False)
+        elif choice == "6":
+            context = _select_topology(contexts)
+            _export_analysis(
+                context,
+                current_domain,
+                current_method,
+                context.last_analysis,
+                context.last_solutions,
+            )
+        elif choice == "7":
+            contexts = _load_interactive_topology(current_domain)
+        elif choice == "8":
+            print("Saliendo del menú interactivo.")
+            break
+        else:
+            print("Opción no válida. Intenta de nuevo.")
 
 
 def run(args: argparse.Namespace) -> dict:
@@ -2203,6 +2474,9 @@ def run(args: argparse.Namespace) -> dict:
 def main():
     parser = build_parser()
     args = parser.parse_args()
+    if getattr(args, "menu", False):
+        interactive_menu(args.domain, args.method)
+        return
     payload = run(args)
     print("\nResumen (JSON):")
     print(json.dumps(_sanitize_for_json(payload), indent=2, ensure_ascii=False))
