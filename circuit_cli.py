@@ -497,7 +497,7 @@ def _fundamental_cycles(graph: CircuitGraph) -> List[list]:
     visited_nodes: Set[str] = set()
     tree_edges: Set[int] = set()
     chords: List[int] = []
-    start_node = next(iter(graph.nodes))
+    start_node = sorted(graph.nodes)[0]
     queue = [start_node]
     visited_nodes.add(start_node)
 
@@ -567,7 +567,7 @@ def _build_mesh_system(graph: CircuitGraph, domain: str) -> MeshSystem:
                 continue
 
             if component.type == "V":
-                expression += sign * source_value(component)
+                expression -= sign * source_value(component)
                 continue
 
             impedance = impedance_for_component(component, domain)
@@ -731,7 +731,7 @@ def parse_falstad_netlist(
     return components
 
 
-def parse_component_line(line: str, normalizer: UnitNormalizer) -> ComponentSpec:
+def _parse_component_line_csv(line: str, normalizer: UnitNormalizer) -> ComponentSpec:
     parts = [piece.strip() for piece in line.split(",") if piece.strip()]
     if len(parts) not in (5, 6):
         raise ValueError(
@@ -749,6 +749,46 @@ def parse_component_line(line: str, normalizer: UnitNormalizer) -> ComponentSpec
         orientation=orientation,
         normalizer=normalizer,
     )
+
+
+def _parse_component_line_spice(line: str, normalizer: UnitNormalizer) -> ComponentSpec:
+    tokens = line.split()
+    if len(tokens) not in (4, 5):
+        raise ValueError(
+            "Cada componente debe tener 4 o 5 campos: "
+            "Nombre NodoA NodoB Valor [CondiciónInicial]."
+        )
+
+    name = tokens[0].strip()
+    if not name:
+        raise ValueError("El nombre del componente no puede estar vacío.")
+
+    comp_type = name[0].upper()
+    node_a, node_b, value = tokens[1], tokens[2], tokens[3]
+
+    if len(tokens) == 5:
+        if comp_type in {"L", "C"}:
+            ic_value = tokens[4]
+            value = f"{value} ic={ic_value}"
+        else:
+            raise ValueError(
+                "Las condiciones iniciales solo se aceptan para inductores y capacitores."
+            )
+
+    return ComponentSpec(
+        type=comp_type,
+        name=name,
+        node_a=node_a,
+        node_b=node_b,
+        value=value,
+        normalizer=normalizer,
+    )
+
+
+def parse_component_line(line: str, normalizer: UnitNormalizer) -> ComponentSpec:
+    if "," in line:
+        return _parse_component_line_csv(line, normalizer)
+    return _parse_component_line_spice(line, normalizer)
 
 
 def load_components_from_csv(path: str, normalizer: UnitNormalizer) -> list:
