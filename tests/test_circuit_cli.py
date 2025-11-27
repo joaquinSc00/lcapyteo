@@ -12,6 +12,7 @@ from circuit_cli import (  # noqa: E402
     export_to_csv,
     export_to_latex,
     nodal_equations,
+    parse_component_line,
     parse_falstad_netlist,
     parse_substitutions,
     solve_equations,
@@ -145,3 +146,25 @@ def test_falstad_netlist_with_initial_condition_parses_successfully():
     assert any(comp.value.endswith("ic=0.25") for comp in components if comp.type == "L")
     inductor = next(comp for comp in components if comp.type == "L")
     assert inductor.netlist_line().endswith("ic=0.25")
+
+
+def test_parse_component_line_detects_spice_separator():
+    normalizer = UnitNormalizer()
+
+    resistor = parse_component_line("R1 1 2 4", normalizer)
+
+    assert resistor.type == "R"
+    assert resistor.node_a == "1"
+    assert resistor.node_b == "2"
+    assert resistor.value == "4"
+    assert resistor.netlist_line() == "R1 1 2 4"
+
+
+def test_parse_component_line_handles_initial_condition_for_lc():
+    normalizer = UnitNormalizer()
+
+    capacitor = parse_component_line("C1 0 3 0.5 1", normalizer)
+
+    assert capacitor.type == "C"
+    assert capacitor.value == "0.5 ic=1"
+    assert capacitor.netlist_line() == "C1 0 3 0.5 ic=1"
