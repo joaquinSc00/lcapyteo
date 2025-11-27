@@ -1,6 +1,8 @@
-import sympy as sp
 from pathlib import Path
 import sys
+import argparse
+
+import sympy as sp
 
 sys.path.append(str(Path(__file__).resolve().parents[1]))
 
@@ -8,6 +10,7 @@ from circuit_cli import (  # noqa: E402
     CircuitGraph,
     ComponentSpec,
     UnitNormalizer,
+    SESSION,
     _format_equations,
     export_to_csv,
     export_to_latex,
@@ -15,6 +18,7 @@ from circuit_cli import (  # noqa: E402
     parse_component_line,
     parse_falstad_netlist,
     parse_substitutions,
+    run,
     solve_equations,
 )
 
@@ -168,3 +172,60 @@ def test_parse_component_line_handles_initial_condition_for_lc():
     assert capacitor.type == "C"
     assert capacitor.value == "0.5 ic=1"
     assert capacitor.netlist_line() == "C1 0 3 0.5 ic=1"
+
+
+def _make_args(csv_paths, domain="laplace"):
+    if isinstance(csv_paths, (str, Path)):
+        csv_paths = [csv_paths]
+    return argparse.Namespace(
+        mode="single" if len(csv_paths) == 1 else "double",
+        csv=[str(path) for path in csv_paths],
+        falstad=None,
+        method="nodal",
+        domain=domain,
+        show_matrices=False,
+        show_lcapy=False,
+        solve=False,
+        analyze=False,
+        substitute=None,
+        export_csv=None,
+        export_latex=None,
+        plot_time=None,
+        plot_freq=None,
+        query=None,
+        query_time=None,
+    )
+
+
+def test_session_stores_single_topology_variants(tmp_path):
+    csv_path = tmp_path / "single.csv"
+    csv_path.write_text("\n".join(["V,V1,n1,0,5", "R,R1,n1,0,1k"]), encoding="utf-8")
+
+    args = _make_args(csv_path, domain="jw")
+    result = run(args)
+
+    session_summary = result["session"]
+    assert session_summary["active_domain"] == "jw"
+    single = session_summary["topologies"]["single"]
+    assert single["references"]["circuit"]
+    assert single["references"]["circuit_dc"]
+    assert single["references"]["circuit_s"]
+    assert single["references"]["circuit_jw"]
+    assert "V1" in single["netlist"]
+    assert SESSION.topologies["single"].circuit_jw is not None
+
+
+def test_session_tracks_double_topology(tmp_path):
+    pre_csv = tmp_path / "pre.csv"
+    post_csv = tmp_path / "post.csv"
+    pre_csv.write_text("\n".join(["V,V1,n1,0,5", "R,R1,n1,0,1k"]), encoding="utf-8")
+    post_csv.write_text("\n".join(["V,V1,n1,0,10", "R,R1,n1,0,2k"]), encoding="utf-8")
+
+    args = _make_args([pre_csv, post_csv])
+    result = run(args)
+
+    session_summary = result["session"]
+    assert set(session_summary["topologies"].keys()) == {"pre", "post"}
+    assert session_summary["active_domain"] == "laplace"
+    assert SESSION.topologies["pre"].circuit_dc is not None
+    assert SESSION.topologies["post"].circuit_s is not None
