@@ -534,7 +534,17 @@ def _fundamental_cycles(graph: CircuitGraph) -> List[list]:
     return cycles
 
 
-def mesh_equations(graph: CircuitGraph, domain: str) -> Tuple[list, List[str]]:
+@dataclass
+class MeshSystem:
+    equations: List[sp.Eq]
+    warnings: List[str]
+    mesh_currents: List[sp.Symbol]
+    cycles: List[list]
+    edges: List[Tuple[int, ComponentSpec]]
+    edge_to_cycles: Dict[int, List[Tuple[int, int]]]
+
+
+def _build_mesh_system(graph: CircuitGraph, domain: str) -> MeshSystem:
     cycles = _fundamental_cycles(graph)
     edges = _build_edges(graph)
     mesh_currents = [sp.symbols(f"I_M{idx+1}") for idx in range(len(cycles))]
@@ -573,7 +583,19 @@ def mesh_equations(graph: CircuitGraph, domain: str) -> Tuple[list, List[str]]:
             expression += sign * impedance * shared_current
         equations.append(sp.Eq(expression, 0))
 
-    return equations, sorted(set(warnings))
+    return MeshSystem(
+        equations=equations,
+        warnings=sorted(set(warnings)),
+        mesh_currents=mesh_currents,
+        cycles=cycles,
+        edges=edges,
+        edge_to_cycles=edge_to_cycles,
+    )
+
+
+def mesh_equations(graph: CircuitGraph, domain: str) -> Tuple[list, List[str]]:
+    system = _build_mesh_system(graph, domain)
+    return system.equations, system.warnings
 
 
 def parse_falstad_netlist(
@@ -901,6 +923,107 @@ def solve_equations(
     return {symbol.name: value for symbol, value in zip(symbols, solution)}
 
 
+def _eval_complex(expr: sp.Expr, substitutions: Optional[Dict[sp.Symbol, sp.Expr]] = None):
+    try:
+        numeric = expr.subs(substitutions or {})
+        return complex(numeric.evalf())
+    except Exception:
+        return None
+
+
+def _phasor_str(value: complex) -> str:
+    magnitude = abs(value)
+    angle_deg = np.degrees(np.angle(value))
+    return f"{magnitude:.4g} ∠ {angle_deg:.2f}°"
+
+
+def _evaluate_cycle_residuals(system: MeshSystem, substitutions: Dict[sp.Symbol, sp.Expr]):
+    residuals = []
+    for eq in system.equations:
+        try:
+            evaluated = eq.lhs.subs(substitutions).evalf() - eq.rhs.subs(substitutions).evalf()
+            residuals.append(evaluated)
+        except Exception:
+            residuals.append(None)
+    return residuals
+
+
+def perform_numeric_analysis(
+    graph: CircuitGraph,
+    domain: str,
+    method: str,
+    substitutions: Optional[Dict[sp.Symbol, sp.Expr]] = None,
+):
+    substitutions = substitutions or {}
+    if method == "mesh":
+        mesh_system = _build_mesh_system(graph, domain)
+        equations, warnings = mesh_system.equations, mesh_system.warnings
+    else:
+        equations, warnings = nodal_equations(graph, domain)
+        mesh_system = None
+
+    matrix, vector, symbols = _matrix_from_equations(
+        [eq.subs(substitutions) for eq in equations]
+    )
+    solutions = solve_equations(equations, substitutions)
+
+    numeric_solutions = {}
+    for name, expr in solutions.items():
+        value = _eval_complex(expr, substitutions)
+        if value is not None:
+            numeric_solutions[name] = value
+
+    summary = {
+        "matrix": matrix,
+        "vector": vector,
+        "variables": symbols,
+        "warnings": warnings,
+        "solutions": solutions,
+        "numeric_solutions": numeric_solutions,
+    }
+
+    if mesh_system and numeric_solutions:
+        phasors = {}
+        for symbol in mesh_system.mesh_currents:
+            if symbol.name in numeric_solutions:
+                phasors[symbol.name] = _phasor_str(numeric_solutions[symbol.name])
+
+        branch_voltages = []
+        for edge_id, component in mesh_system.edges:
+            impedance = impedance_for_component(component, domain)
+            if impedance is None:
+                continue
+            current_expr = 0
+            for mesh_idx, sign in mesh_system.edge_to_cycles.get(edge_id, []):
+                current_expr += sign * mesh_system.mesh_currents[mesh_idx]
+            voltage_expr = impedance * current_expr
+            numeric_voltage = _eval_complex(voltage_expr, substitutions | solutions)
+            if numeric_voltage is None:
+                continue
+            branch_voltages.append(
+                {
+                    "component": component.name,
+                    "value": numeric_voltage,
+                    "formatted": _phasor_str(numeric_voltage),
+                }
+            )
+
+        residuals = _evaluate_cycle_residuals(mesh_system, substitutions | solutions)
+        formatted_residuals = [
+            _phasor_str(complex(res)) if res is not None else "N/A" for res in residuals
+        ]
+
+        summary.update(
+            {
+                "mesh_currents": phasors,
+                "branch_voltages": branch_voltages,
+                "kvl_residuals": formatted_residuals,
+            }
+        )
+
+    return summary
+
+
 def _ensure_parent_dir(path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -1079,6 +1202,14 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--analyze",
+        action="store_true",
+        help=(
+            "Modo de análisis numérico: construye la matriz de admitancias/impedancias y "
+            "muestra fasores (usar --domain jw para AC)."
+        ),
+    )
+    parser.add_argument(
         "--substitute",
         nargs="+",
         metavar="NOMBRE=VALOR",
@@ -1167,6 +1298,32 @@ def print_symbolic(label: str, summary: dict, method: str, show_matrices: bool) 
         print("Vector B:")
         print(sp.Matrix(summary["matrix_B"]))
         print(f"Variables: {', '.join(summary['variables'])}")
+
+
+def print_numeric(label: str, analysis: dict, method: str) -> None:
+    matrix_label = "Z" if method == "mesh" else "Y"
+    if analysis.get("matrix") is not None:
+        print(f"\nMatriz {matrix_label} para {label}:")
+        print(sp.Matrix(analysis["matrix"]))
+        print("Vector de fuentes:")
+        print(sp.Matrix(analysis["vector"]))
+        if analysis.get("variables"):
+            print(f"Variables: {', '.join(sym.name for sym in analysis['variables'])}")
+
+    if analysis.get("mesh_currents"):
+        print("\nCorrientes de malla (fasores mag/áng):")
+        for name, formatted in analysis["mesh_currents"].items():
+            print(f" - {name}: {formatted}")
+
+    if analysis.get("branch_voltages"):
+        print("\nTensiones por rama:")
+        for item in analysis["branch_voltages"]:
+            print(f" - {item['component']}: {item['formatted']}")
+
+    if analysis.get("kvl_residuals"):
+        print("\nVerificación de KVL (suma de caídas):")
+        for idx, residual in enumerate(analysis["kvl_residuals"], start=1):
+            print(f" - Malla {idx}: {residual}")
 
 
 def _plot_instructions(args: argparse.Namespace) -> List[dict]:
@@ -1369,6 +1526,10 @@ def run(args: argparse.Namespace) -> dict:
         analysis_summary, solutions = enrich_analysis(
             analysis_summary, "single", args, substitutions, requested_set
         )
+        numeric_analysis = None
+        if args.analyze:
+            numeric_analysis = perform_numeric_analysis(graph, domain, method, substitutions)
+            analysis_summary["numeric_analysis"] = _sanitize_for_json(numeric_analysis)
         if args.export_csv:
             export_to_csv(_labelled_path(args.export_csv, "single"), analysis_summary, solutions)
         if args.export_latex:
@@ -1376,6 +1537,8 @@ def run(args: argparse.Namespace) -> dict:
                 _labelled_path(args.export_latex, "single"), analysis_summary, solutions
             )
         print_symbolic("topología única", analysis_summary, method, args.show_matrices)
+        if numeric_analysis:
+            print_numeric("topología única", numeric_analysis, method)
         if args.show_lcapy:
             print("\nNetlist lcapy:")
             print(circuit)
@@ -1385,6 +1548,8 @@ def run(args: argparse.Namespace) -> dict:
             "netlist": str(circuit),
             "analysis": analysis_summary,
         }
+        if numeric_analysis:
+            result["numeric_analysis"] = _sanitize_for_json(numeric_analysis)
         result.update(summarize_graph(graph, "pre"))
         return result
 
@@ -1411,6 +1576,10 @@ def run(args: argparse.Namespace) -> dict:
         substitutions,
         requested_set if query_time == "pre" else (set() if requested_set else None),
     )
+    numeric_pre = None
+    if args.analyze:
+        numeric_pre = perform_numeric_analysis(graph_pre, domain, method, substitutions)
+        analysis_pre["numeric_analysis"] = _sanitize_for_json(numeric_pre)
     analysis_post = symbolic_analysis(graph_post, domain, method, args.show_matrices)
     analysis_post, solutions_post = enrich_analysis(
         analysis_post,
@@ -1419,6 +1588,10 @@ def run(args: argparse.Namespace) -> dict:
         substitutions,
         requested_set if query_time == "post" else (set() if requested_set else None),
     )
+    numeric_post = None
+    if args.analyze:
+        numeric_post = perform_numeric_analysis(graph_post, domain, method, substitutions)
+        analysis_post["numeric_analysis"] = _sanitize_for_json(numeric_post)
 
     if args.export_csv:
         export_to_csv(_labelled_path(args.export_csv, "pre"), analysis_pre, solutions_pre)
@@ -1435,6 +1608,10 @@ def run(args: argparse.Namespace) -> dict:
 
     print_symbolic("topología t<0", analysis_pre, method, args.show_matrices)
     print_symbolic("topología t>0", analysis_post, method, args.show_matrices)
+    if numeric_pre:
+        print_numeric("topología t<0", numeric_pre, method)
+    if numeric_post:
+        print_numeric("topología t>0", numeric_post, method)
     if args.show_lcapy:
         print("\nNetlist lcapy t<0:")
         print(circuit_pre)
@@ -1450,6 +1627,8 @@ def run(args: argparse.Namespace) -> dict:
         "switched_mode": "pre" if switched.for_time(-1) is circuit_pre else "post",
         "analysis_pre": analysis_pre,
         "analysis_post": analysis_post,
+        "numeric_pre": _sanitize_for_json(numeric_pre) if numeric_pre else None,
+        "numeric_post": _sanitize_for_json(numeric_post) if numeric_post else None,
     }
     result.update(summarize_graph(graph_pre, "pre"))
     result.update(summarize_graph(graph_post, "post"))
