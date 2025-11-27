@@ -2,6 +2,7 @@ import argparse
 import csv
 import json
 import textwrap
+import warnings
 from collections import defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -430,6 +431,16 @@ def _derive_circuit_variants(circuit: Circuit) -> Dict[str, Optional[Circuit]]:
         except Exception:
             variants[key] = None
     return variants
+
+
+def _circuit_for_domain(entry: SessionEntry, domain: str) -> Circuit:
+    if domain == "laplace" and entry.circuit_s is not None:
+        return entry.circuit_s
+    if domain == "jw" and entry.circuit_jw is not None:
+        return entry.circuit_jw
+    if domain == "time" and entry.circuit_dc is not None:
+        return entry.circuit_dc
+    return entry.circuit
 
 
 def _numeric_value(component: ComponentSpec) -> sp.Expr:
@@ -967,6 +978,18 @@ def _format_equations(equations: Sequence[sp.Eq]) -> List[Dict[str, str]]:
     return formatted
 
 
+def _format_labelled_equations(
+    equations: Sequence[sp.Eq], labels: Sequence[str]
+) -> List[Dict[str, str]]:
+    labelled = []
+    formatted = _format_equations(equations)
+    for idx, eq in enumerate(formatted):
+        entry = dict(eq)
+        entry["label"] = labels[idx] if idx < len(labels) else f"Eq{idx+1}"
+        labelled.append(entry)
+    return labelled
+
+
 def _equation_repr(equation, style: str = "plain") -> str:
     if isinstance(equation, dict):
         return equation.get(style) or equation.get("plain", "")
@@ -995,6 +1018,89 @@ def _matrix_from_equations(equations: Sequence[sp.Eq]) -> Tuple[sp.Matrix, sp.Ma
         return sp.Matrix(), sp.Matrix(), []
     matrix, vector = sp.linear_eq_to_matrix(equations, symbols)
     return matrix, vector, symbols
+
+
+def _extract_lcapy_equations(exprdict) -> Tuple[List[sp.Eq], List[str]]:
+    equations: List[sp.Eq] = []
+    labels: List[str] = []
+    for idx, (lhs, rhs) in enumerate(exprdict.items(), start=1):
+        if hasattr(rhs, "lhs") and hasattr(rhs, "rhs"):
+            lhs_expr = rhs.lhs.expr if hasattr(rhs.lhs, "expr") else rhs.lhs
+            rhs_expr = rhs.rhs.expr if hasattr(rhs.rhs, "expr") else rhs.rhs
+            sympy_eq = sp.Eq(sp.simplify(lhs_expr), sp.simplify(rhs_expr))
+        else:
+            lhs_expr = lhs.expr if hasattr(lhs, "expr") else lhs
+            rhs_expr = rhs.expr if hasattr(rhs, "expr") else rhs
+            sympy_eq = sp.Eq(sp.simplify(lhs_expr), sp.simplify(rhs_expr))
+        equations.append(sympy_eq)
+        labels.append(str(lhs) if lhs is not None else f"Eq{idx}")
+    return equations, labels
+
+
+def _lcapy_matrix_equations(circuit: Circuit, method: str) -> Dict[str, object]:
+    try:
+        matrix_equation = circuit.matrix_equations(form="A y = b")
+    except Exception as exc:  # noqa: BLE001 - queremos mostrar el fallo exacto
+        message = str(exc)
+        return {"matrix_error": message, "warnings": [message]}
+
+    try:
+        matrix, variables = matrix_equation.lhs.args
+        vector = matrix_equation.rhs
+    except Exception as exc:  # noqa: BLE001 - estructura inesperada
+        message = f"Formato inesperado de matriz: {exc}"
+        return {"matrix_error": message, "warnings": [message]}
+
+    matrix_label = "Z" if method == "mesh" else "Y"
+    matrix_entries = [
+        f"{matrix_label}{row + 1}{col + 1} = {sp.simplify(matrix[row, col])}"
+        for row in range(matrix.rows)
+        for col in range(matrix.cols)
+    ]
+    vector_entries = [
+        f"b{idx + 1} = {sp.simplify(vector[idx, 0])}"
+        for idx in range(vector.rows)
+    ]
+    return {
+        "lcapy_matrix": matrix,
+        "lcapy_vector": vector,
+        "lcapy_variables": [str(var) for var in variables],
+        "lcapy_matrix_entries": matrix_entries,
+        "lcapy_vector_entries": vector_entries,
+    }
+
+
+def lcapy_symbolic_equations(
+    circuit: Circuit, method: str, include_matrix: bool
+) -> Dict[str, object]:
+    with warnings.catch_warnings(record=True) as captured:
+        warnings.simplefilter("always")
+        try:
+            if method == "mesh":
+                exprdict = circuit.mesh_analysis().mesh_equations()
+            else:
+                exprdict = circuit.nodal_analysis().nodal_equations()
+        except Exception as exc:  # noqa: BLE001 - queremos propagar el error textual
+            message = str(exc)
+            return {"error": message, "warnings": [message]}
+
+    equations, labels = _extract_lcapy_equations(exprdict)
+    summary: Dict[str, object] = {
+        "equations": equations,
+        "formatted": _format_labelled_equations(equations, labels),
+    }
+
+    warning_messages = [str(warning.message) for warning in captured]
+    if warning_messages:
+        summary["warnings"] = warning_messages
+
+    if include_matrix:
+        matrix_summary = _lcapy_matrix_equations(circuit, method)
+        summary.update(matrix_summary)
+        if matrix_summary.get("warnings"):
+            summary.setdefault("warnings", []).extend(matrix_summary["warnings"])
+
+    return summary
 
 
 def parse_substitutions(pairs: Optional[Sequence[str]]) -> Dict[sp.Symbol, sp.Expr]:
@@ -1207,7 +1313,13 @@ def _plot_response(
     plt.close()
 
 
-def symbolic_analysis(graph: CircuitGraph, domain: str, method: str, show_matrices: bool):
+def symbolic_analysis(
+    graph: CircuitGraph,
+    domain: str,
+    method: str,
+    show_matrices: bool,
+    circuit: Optional[Circuit] = None,
+):
     if method == "mesh":
         equations, warnings = mesh_equations(graph, domain)
     else:
@@ -1226,6 +1338,23 @@ def symbolic_analysis(graph: CircuitGraph, domain: str, method: str, show_matric
         summary["matrix_G"] = [[str(item) for item in row] for row in matrix.tolist()]
         summary["matrix_B"] = [[str(item) for item in row] for row in vector.tolist()]
         summary["variables"] = [str(sym) for sym in symbols]
+
+    if circuit is not None:
+        lcapy_summary = lcapy_symbolic_equations(circuit, method, show_matrices)
+        if lcapy_summary.get("formatted"):
+            summary["lcapy_equations"] = lcapy_summary["formatted"]
+            summary["_lcapy_sympy_equations"] = lcapy_summary.get("equations", [])
+        if lcapy_summary.get("lcapy_matrix") is not None:
+            summary["lcapy_matrix"] = lcapy_summary.get("lcapy_matrix")
+            summary["lcapy_vector"] = lcapy_summary.get("lcapy_vector")
+            summary["lcapy_matrix_entries"] = lcapy_summary.get("lcapy_matrix_entries")
+            summary["lcapy_vector_entries"] = lcapy_summary.get("lcapy_vector_entries")
+            summary["lcapy_variables"] = lcapy_summary.get("lcapy_variables")
+        if lcapy_summary.get("error"):
+            summary.setdefault("warnings", []).append(lcapy_summary["error"])
+            summary["lcapy_error"] = lcapy_summary["error"]
+        if lcapy_summary.get("warnings"):
+            summary.setdefault("warnings", []).extend(lcapy_summary["warnings"])
 
     return summary
 
@@ -1408,6 +1537,12 @@ def print_symbolic(label: str, summary: dict, method: str, show_matrices: bool) 
     for eq in summary.get("equations", []):
         print(textwrap.indent(_equation_repr(eq, "pretty"), " - "))
 
+    if summary.get("lcapy_equations"):
+        print("\nEcuaciones generadas por Lcapy:")
+        for eq in summary["lcapy_equations"]:
+            label_prefix = f"[{eq.get('label')}] " if eq.get("label") else ""
+            print(textwrap.indent(f"{label_prefix}{_equation_repr(eq, 'pretty')}", " - "))
+
     for warning in summary.get("warnings", []):
         print(f" ⚠️  {warning}")
 
@@ -1427,6 +1562,18 @@ def print_symbolic(label: str, summary: dict, method: str, show_matrices: bool) 
         print("Vector B:")
         print(sp.Matrix(summary["matrix_B"]))
         print(f"Variables: {', '.join(summary['variables'])}")
+
+    if summary.get("lcapy_matrix_entries"):
+        matrix_label = "Z" if method == "mesh" else "Y"
+        print(f"\nMatriz {matrix_label} (según Lcapy):")
+        for entry in summary["lcapy_matrix_entries"]:
+            print(f" - {entry}")
+        if summary.get("lcapy_vector_entries"):
+            print("Vector b:")
+            for entry in summary["lcapy_vector_entries"]:
+                print(f"   • {entry}")
+        if summary.get("lcapy_variables"):
+            print(f"Variables: {', '.join(summary['lcapy_variables'])}")
 
 
 def print_numeric(label: str, analysis: dict, method: str) -> None:
@@ -1652,8 +1799,11 @@ def run(args: argparse.Namespace) -> dict:
         graph = CircuitGraph(components)
         print_warnings(graph, "topología única")
         circuit = graph.to_lcapy_circuit()
-        SESSION.store("single", circuit, domain)
-        analysis_summary = symbolic_analysis(graph, domain, method, args.show_matrices)
+        entry = SESSION.store("single", circuit, domain)
+        circuit_variant = _circuit_for_domain(entry, domain)
+        analysis_summary = symbolic_analysis(
+            graph, domain, method, args.show_matrices, circuit_variant
+        )
         analysis_summary, solutions = enrich_analysis(
             analysis_summary, "single", args, substitutions, requested_set
         )
@@ -1700,10 +1850,12 @@ def run(args: argparse.Namespace) -> dict:
     print_warnings(graph_post, "topología t>0")
     circuit_pre = graph_pre.to_lcapy_circuit()
     circuit_post = graph_post.to_lcapy_circuit()
-    SESSION.store("pre", circuit_pre, domain)
-    SESSION.store("post", circuit_post, domain)
     switched = SwitchedCircuit(circuit_pre, circuit_post)
-    analysis_pre = symbolic_analysis(graph_pre, domain, method, args.show_matrices)
+    entry_pre = SESSION.store("pre", circuit_pre, domain)
+    circuit_variant_pre = _circuit_for_domain(entry_pre, domain)
+    analysis_pre = symbolic_analysis(
+        graph_pre, domain, method, args.show_matrices, circuit_variant_pre
+    )
     analysis_pre, solutions_pre = enrich_analysis(
         analysis_pre,
         "pre",
@@ -1715,7 +1867,11 @@ def run(args: argparse.Namespace) -> dict:
     if args.analyze:
         numeric_pre = perform_numeric_analysis(graph_pre, domain, method, substitutions)
         analysis_pre["numeric_analysis"] = _sanitize_for_json(numeric_pre)
-    analysis_post = symbolic_analysis(graph_post, domain, method, args.show_matrices)
+    entry_post = SESSION.store("post", circuit_post, domain)
+    circuit_variant_post = _circuit_for_domain(entry_post, domain)
+    analysis_post = symbolic_analysis(
+        graph_post, domain, method, args.show_matrices, circuit_variant_post
+    )
     analysis_post, solutions_post = enrich_analysis(
         analysis_post,
         "post",
