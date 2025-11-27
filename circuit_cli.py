@@ -23,6 +23,61 @@ DEFAULT_UNITS: Dict[str, str] = {
     "G": "siemens",
 }
 
+
+@dataclass
+class SessionEntry:
+    label: str
+    domain: str
+    circuit: Circuit
+    circuit_dc: Optional[Circuit]
+    circuit_s: Optional[Circuit]
+    circuit_jw: Optional[Circuit]
+
+    def describe(self) -> Dict[str, object]:
+        return {
+            "label": self.label,
+            "domain": self.domain,
+            "netlist": str(self.circuit),
+            "references": {
+                "circuit": True,
+                "circuit_dc": self.circuit_dc is not None,
+                "circuit_s": self.circuit_s is not None,
+                "circuit_jw": self.circuit_jw is not None,
+            },
+        }
+
+
+class SessionContainer:
+    def __init__(self) -> None:
+        self.reset()
+
+    def reset(self) -> None:
+        self.active_domain: Optional[str] = None
+        self.topologies: Dict[str, SessionEntry] = {}
+
+    def store(self, label: str, circuit: Circuit, domain: str) -> SessionEntry:
+        variants = _derive_circuit_variants(circuit)
+        entry = SessionEntry(
+            label=label,
+            domain=domain,
+            circuit=circuit,
+            circuit_dc=variants.get("dc"),
+            circuit_s=variants.get("laplace"),
+            circuit_jw=variants.get("ac"),
+        )
+        self.topologies[label] = entry
+        self.active_domain = domain
+        return entry
+
+    def describe(self) -> Dict[str, object]:
+        return {
+            "active_domain": self.active_domain,
+            "topologies": {label: entry.describe() for label, entry in self.topologies.items()},
+        }
+
+
+SESSION = SessionContainer()
+
 VALID_COMPONENT_TYPES: Set[str] = {
     "R",
     "L",
@@ -361,6 +416,20 @@ def _domain_operator(domain: str) -> sp.Expr:
     if domain == "jw":
         return sp.I * sp.symbols("w")
     return sp.symbols("d_dt")
+
+
+def _derive_circuit_variants(circuit: Circuit) -> Dict[str, Optional[Circuit]]:
+    variants: Dict[str, Optional[Circuit]] = {}
+    for key, builder in (
+        ("dc", circuit.dc),
+        ("laplace", circuit.laplace),
+        ("ac", circuit.ac),
+    ):
+        try:
+            variants[key] = builder()
+        except Exception:
+            variants[key] = None
+    return variants
 
 
 def _numeric_value(component: ComponentSpec) -> sp.Expr:
@@ -1314,6 +1383,26 @@ def print_warnings(graph: CircuitGraph, label: str) -> None:
         print(f" - {warning}")
 
 
+def print_session_summary() -> None:
+    if not SESSION.topologies:
+        return
+    summary = SESSION.describe()
+    active = summary.get("active_domain")
+    print("\nSesión activa:")
+    print(f" - Dominio activo: {active}")
+    for label, entry in summary.get("topologies", {}).items():
+        references = ", ".join(
+            ref
+            for ref, available in entry.get("references", {}).items()
+            if available
+        )
+        print(
+            " - {label}: netlist almacenado; referencias: {refs}".format(
+                label=label, refs=references or "ninguna"
+            )
+        )
+
+
 def print_symbolic(label: str, summary: dict, method: str, show_matrices: bool) -> None:
     print(f"\nEcuaciones simbólicas ({method}) para {label}:")
     for eq in summary.get("equations", []):
@@ -1482,6 +1571,7 @@ def enrich_analysis(
 
 
 def run(args: argparse.Namespace) -> dict:
+    SESSION.reset()
     mode = args.mode
     normalizer = UnitNormalizer()
     domain = args.domain
@@ -1562,6 +1652,7 @@ def run(args: argparse.Namespace) -> dict:
         graph = CircuitGraph(components)
         print_warnings(graph, "topología única")
         circuit = graph.to_lcapy_circuit()
+        SESSION.store("single", circuit, domain)
         analysis_summary = symbolic_analysis(graph, domain, method, args.show_matrices)
         analysis_summary, solutions = enrich_analysis(
             analysis_summary, "single", args, substitutions, requested_set
@@ -1580,12 +1671,14 @@ def run(args: argparse.Namespace) -> dict:
         if numeric_analysis:
             print_numeric("topología única", numeric_analysis, method)
         if args.show_lcapy:
-            print("\nNetlist lcapy:")
+            print(f"\nNetlist lcapy (dominio activo: {domain}):")
             print(circuit)
+            print_session_summary()
         result = {
             "mode": mode,
             "components": [component.as_dict() for component in components],
             "netlist": str(circuit),
+            "session": SESSION.describe(),
             "analysis": analysis_summary,
         }
         if numeric_analysis:
@@ -1607,6 +1700,8 @@ def run(args: argparse.Namespace) -> dict:
     print_warnings(graph_post, "topología t>0")
     circuit_pre = graph_pre.to_lcapy_circuit()
     circuit_post = graph_post.to_lcapy_circuit()
+    SESSION.store("pre", circuit_pre, domain)
+    SESSION.store("post", circuit_post, domain)
     switched = SwitchedCircuit(circuit_pre, circuit_post)
     analysis_pre = symbolic_analysis(graph_pre, domain, method, args.show_matrices)
     analysis_pre, solutions_pre = enrich_analysis(
@@ -1653,10 +1748,11 @@ def run(args: argparse.Namespace) -> dict:
     if numeric_post:
         print_numeric("topología t>0", numeric_post, method)
     if args.show_lcapy:
-        print("\nNetlist lcapy t<0:")
+        print(f"\nNetlist lcapy t<0 (dominio activo: {domain}):")
         print(circuit_pre)
-        print("\nNetlist lcapy t>0:")
+        print("\nNetlist lcapy t>0 (dominio activo: {domain}):")
         print(circuit_post)
+        print_session_summary()
 
     result = {
         "mode": mode,
@@ -1665,6 +1761,7 @@ def run(args: argparse.Namespace) -> dict:
         "netlist_pre": str(circuit_pre),
         "netlist_post": str(circuit_post),
         "switched_mode": "pre" if switched.for_time(-1) is circuit_pre else "post",
+        "session": SESSION.describe(),
         "analysis_pre": analysis_pre,
         "analysis_post": analysis_post,
         "numeric_pre": _sanitize_for_json(numeric_pre) if numeric_pre else None,
