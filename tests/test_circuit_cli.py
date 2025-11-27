@@ -186,6 +186,12 @@ def _make_args(csv_paths, domain="laplace"):
         show_matrices=False,
         show_lcapy=False,
         solve=False,
+        lcapy_solve=None,
+        solution_vars=None,
+        solution_time=False,
+        solution_simplify=False,
+        solution_factor=False,
+        solution_collect=None,
         analyze=False,
         substitute=None,
         export_csv=None,
@@ -229,3 +235,45 @@ def test_session_tracks_double_topology(tmp_path):
     assert session_summary["active_domain"] == "laplace"
     assert SESSION.topologies["pre"].circuit_dc is not None
     assert SESSION.topologies["post"].circuit_s is not None
+
+
+def test_lcapy_branch_solutions_filtered(tmp_path):
+    csv_path = tmp_path / "single.csv"
+    csv_path.write_text(
+        "\n".join(["V,V1,vin,0,10", "R,R1,vin,vout,1k", "R,R2,vout,0,1k"]),
+        encoding="utf-8",
+    )
+
+    args = _make_args(csv_path)
+    args.lcapy_solve = ["branch"]
+    args.solution_vars = ["IR1"]
+    args.solution_simplify = True
+
+    result = run(args)
+
+    lcapy_solutions = result["analysis"].get("lcapy_solutions", {})
+    assert "branches" in lcapy_solutions
+    assert set(lcapy_solutions["branches"].keys()) == {"IR1"}
+    ir1_expr = sp.sympify(lcapy_solutions["branches"]["IR1"])
+    assert sp.simplify(ir1_expr - 1 / (200 * sp.symbols("s"))) == 0
+
+
+def test_lcapy_node_solution_time_domain(tmp_path):
+    csv_path = tmp_path / "single.csv"
+    csv_path.write_text(
+        "\n".join(["V,V1,vin,0,10", "R,R1,vin,vout,1k", "R,R2,vout,0,1k"]),
+        encoding="utf-8",
+    )
+
+    args = _make_args(csv_path)
+    args.lcapy_solve = ["node"]
+    args.solution_vars = ["Vvout"]
+    args.solution_time = True
+    args.solution_simplify = True
+
+    result = run(args)
+    lcapy_solutions = result["analysis"].get("lcapy_solutions", {})
+    assert "nodes" in lcapy_solutions
+    vout_expr = sp.sympify(lcapy_solutions["nodes"].get("Vvout"))
+    t = sp.symbols("t")
+    assert sp.simplify(vout_expr - 5 * sp.Heaviside(t)) == 0

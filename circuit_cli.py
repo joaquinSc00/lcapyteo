@@ -1001,19 +1001,24 @@ def _equation_repr(equation, style: str = "plain") -> str:
     return str(equation)
 
 
-def _matrix_from_equations(equations: Sequence[sp.Eq]) -> Tuple[sp.Matrix, sp.Matrix, list]:
-    parameter_names = {"s", "w", "d_dt"}
-    variable_prefixes = ("V_", "I_", "I_M")
-    symbols = sorted(
-        {
-            sym
-            for eq in equations
-            for sym in eq.free_symbols
-            if sym.name not in parameter_names
-            and sym.name.startswith(variable_prefixes)
-        },
-        key=lambda s: s.name,
-    )
+def _matrix_from_equations(
+    equations: Sequence[sp.Eq], explicit_symbols: Optional[Sequence[sp.Symbol]] = None
+) -> Tuple[sp.Matrix, sp.Matrix, list]:
+    if explicit_symbols:
+        symbols = list(explicit_symbols)
+    else:
+        parameter_names = {"s", "w", "d_dt"}
+        variable_prefixes = ("V_", "I_", "I_M")
+        symbols = sorted(
+            {
+                sym
+                for eq in equations
+                for sym in eq.free_symbols
+                if sym.name not in parameter_names
+                and sym.name.startswith(variable_prefixes)
+            },
+            key=lambda s: s.name,
+        )
     if not symbols:
         return sp.Matrix(), sp.Matrix(), []
     matrix, vector = sp.linear_eq_to_matrix(equations, symbols)
@@ -1103,6 +1108,154 @@ def lcapy_symbolic_equations(
     return summary
 
 
+def _map_unknown_functions_to_symbols(unknowns: Iterable[sp.Expr]) -> Dict[sp.Expr, sp.Symbol]:
+    mapping: Dict[sp.Expr, sp.Symbol] = {}
+    for unknown in unknowns:
+        name = str(unknown)
+        if name.endswith("(s)"):
+            name = name[:-3]
+        mapping[unknown] = sp.symbols(name)
+    return mapping
+
+
+def _functions_to_symbols_from_equations(
+    equations: Sequence[sp.Eq], s_symbol: sp.Symbol
+) -> Dict[sp.Expr, sp.Symbol]:
+    functions = set()
+    for eq in equations:
+        functions.update(eq.atoms(sp.Function))
+    filtered = [func for func in functions if len(func.args) == 1]
+    return _map_unknown_functions_to_symbols(filtered)
+
+
+def _extract_solution_mapping(unknowns: Iterable[sp.Expr], solutions: Dict[str, sp.Expr]):
+    final: Dict[str, sp.Expr] = {}
+    for unknown in unknowns:
+        name = str(unknown)
+        if name.endswith("(s)"):
+            name = name[:-3]
+        if name in solutions:
+            final[name] = solutions[name]
+    return final
+
+
+def _superposition_to_expr(entry) -> Optional[sp.Expr]:
+    expr_dict = getattr(entry, "expr", None)
+    if isinstance(expr_dict, dict):
+        if "s" in expr_dict:
+            return expr_dict["s"]
+        if expr_dict:
+            return next(iter(expr_dict.values()))
+    try:
+        return sp.sympify(entry)
+    except Exception:
+        return None
+
+
+def lcapy_solutions(
+    circuit: Circuit,
+    scopes: Iterable[str],
+    requested_vars: Optional[Set[str]],
+    simplify: bool,
+    factor: bool,
+    collect_symbol: Optional[str],
+    to_time: bool,
+) -> Tuple[Dict[str, Dict[str, str]], List[str]]:
+    warnings_list: List[str] = []
+    solutions: Dict[str, Dict[str, str]] = {}
+    requested = None if requested_vars is None else set(requested_vars)
+
+    cct_s = circuit.laplace()
+    s_symbol = sp.symbols("s")
+
+    if "node" in scopes:
+        try:
+            analysis = cct_s.nodal_analysis()
+            equations_raw, _ = _extract_lcapy_equations(analysis.nodal_equations())
+            mapping = _functions_to_symbols_from_equations(equations_raw, s_symbol)
+            equations = [sp.Eq(eq.lhs.subs(mapping), eq.rhs.subs(mapping)) for eq in equations_raw]
+            solved = solve_equations(equations, symbols=list(mapping.values()))
+            node_solutions = _extract_solution_mapping(mapping.values(), solved)
+            formatted: Dict[str, str] = {}
+            for name, expr in node_solutions.items():
+                if requested is not None and name not in requested:
+                    continue
+                transformed = _simplify_expression(expr, simplify, factor, collect_symbol)
+                if to_time:
+                    transformed = _inverse_laplace(transformed)
+                    transformed = _simplify_expression(
+                        transformed, simplify, factor, collect_symbol
+                    )
+                formatted[name] = str(transformed)
+            if formatted:
+                solutions["nodes"] = formatted
+        except Exception as exc:  # noqa: BLE001
+            warnings_list.append(f"Error al resolver tensiones de nodo: {exc}")
+
+    if "mesh" in scopes:
+        try:
+            loop_analysis = cct_s.loop_analysis()
+            equations_raw, _ = _extract_lcapy_equations(loop_analysis.mesh_equations())
+            mapping = _functions_to_symbols_from_equations(equations_raw, s_symbol)
+            equations = [sp.Eq(eq.lhs.subs(mapping), eq.rhs.subs(mapping)) for eq in equations_raw]
+            solved = solve_equations(equations, symbols=list(mapping.values()))
+            mesh_solutions = _extract_solution_mapping(mapping.values(), solved)
+            formatted: Dict[str, str] = {}
+            for name, expr in mesh_solutions.items():
+                if requested is not None and name not in requested:
+                    continue
+                transformed = _simplify_expression(expr, simplify, factor, collect_symbol)
+                if to_time:
+                    transformed = _inverse_laplace(transformed)
+                    transformed = _simplify_expression(
+                        transformed, simplify, factor, collect_symbol
+                    )
+                formatted[name] = str(transformed)
+            if formatted:
+                solutions["meshes"] = formatted
+        except Exception as exc:  # noqa: BLE001
+            warnings_list.append(f"Error al resolver corrientes de malla: {exc}")
+
+    if "branch" in scopes:
+        branch_map: Dict[str, sp.Expr] = {}
+        try:
+            current_names = [str(name) for name in cct_s.branch_current_names()]
+            branch_currents = cct_s.branch_currents()
+            for name, current in zip(current_names, branch_currents):
+                expr = _superposition_to_expr(current)
+                if expr is not None:
+                    branch_map[name] = expr
+        except Exception as exc:  # noqa: BLE001
+            warnings_list.append(f"Error al obtener corrientes de rama: {exc}")
+
+        try:
+            voltage_names = [str(name) for name in cct_s.branch_voltage_names()]
+            branch_voltages = cct_s.branch_voltages()
+            for name, voltage in zip(voltage_names, branch_voltages):
+                expr = _superposition_to_expr(voltage)
+                if expr is not None:
+                    branch_map[name] = expr
+        except Exception as exc:  # noqa: BLE001
+            warnings_list.append(f"Error al obtener tensiones de rama: {exc}")
+
+        if branch_map:
+            formatted: Dict[str, str] = {}
+            for name, expr in branch_map.items():
+                if requested is not None and name not in requested:
+                    continue
+                transformed = _simplify_expression(expr, simplify, factor, collect_symbol)
+                if to_time:
+                    transformed = _inverse_laplace(transformed)
+                    transformed = _simplify_expression(
+                        transformed, simplify, factor, collect_symbol
+                    )
+                formatted[name] = str(transformed)
+            if formatted:
+                solutions["branches"] = formatted
+
+    return solutions, warnings_list
+
+
 def parse_substitutions(pairs: Optional[Sequence[str]]) -> Dict[sp.Symbol, sp.Expr]:
     substitutions: Dict[sp.Symbol, sp.Expr] = {}
     if not pairs:
@@ -1123,19 +1276,51 @@ def parse_substitutions(pairs: Optional[Sequence[str]]) -> Dict[sp.Symbol, sp.Ex
 
 
 def solve_equations(
-    equations: Sequence[sp.Eq], substitutions: Optional[Dict[sp.Symbol, sp.Expr]] = None
+    equations: Sequence[sp.Eq],
+    substitutions: Optional[Dict[sp.Symbol, sp.Expr]] = None,
+    symbols: Optional[Sequence[sp.Symbol]] = None,
 ) -> Dict[str, sp.Expr]:
     substituted = [eq.subs(substitutions or {}) for eq in equations]
-    matrix, vector, symbols = _matrix_from_equations(substituted)
-    if not symbols or matrix.is_zero_matrix:
+    matrix, vector, solved_symbols = _matrix_from_equations(
+        substituted, explicit_symbols=symbols
+    )
+    if not solved_symbols or matrix.is_zero_matrix:
         return {}
 
-    solution_set = sp.linsolve((matrix, vector), *symbols)
+    solution_set = sp.linsolve((matrix, vector), *solved_symbols)
     if not solution_set:
         return {}
 
     solution = next(iter(solution_set))
-    return {symbol.name: value for symbol, value in zip(symbols, solution)}
+    return {symbol.name: value for symbol, value in zip(solved_symbols, solution)}
+
+
+def _simplify_expression(
+    expr: sp.Expr,
+    simplify: bool,
+    factor: bool,
+    collect_symbol: Optional[str],
+) -> sp.Expr:
+    result = expr
+    if simplify:
+        result = sp.simplify(result)
+    if factor:
+        result = sp.together(result)
+        result = sp.factor(result)
+    if collect_symbol:
+        sym = sp.symbols(collect_symbol)
+        result = sp.together(result)
+        result = sp.collect(result, sym)
+    return result
+
+
+def _inverse_laplace(expr: sp.Expr) -> sp.Expr:
+    t_symbol = sp.symbols("t")
+    s_symbol = next((sym for sym in expr.free_symbols if sym.name == "s"), sp.symbols("s"))
+    try:
+        return sp.inverse_laplace_transform(expr, s_symbol, t_symbol, noconds=True)
+    except Exception:
+        return expr
 
 
 def _eval_complex(expr: sp.Expr, substitutions: Optional[Dict[sp.Symbol, sp.Expr]] = None):
@@ -1359,6 +1544,30 @@ def symbolic_analysis(
     return summary
 
 
+def _inject_lcapy_solutions(
+    summary: dict,
+    circuit: Circuit,
+    args: argparse.Namespace,
+    requested_vars: Optional[Set[str]],
+) -> None:
+    if not args.lcapy_solve:
+        return
+    scopes = set(args.lcapy_solve)
+    lcapy_result, warnings_list = lcapy_solutions(
+        circuit,
+        scopes,
+        requested_vars,
+        simplify=args.solution_simplify,
+        factor=args.solution_factor,
+        collect_symbol=args.solution_collect,
+        to_time=args.solution_time,
+    )
+    if lcapy_result:
+        summary["lcapy_solutions"] = lcapy_result
+    if warnings_list:
+        summary.setdefault("warnings", []).extend(warnings_list)
+
+
 def build_parser() -> argparse.ArgumentParser:
     description = (
         "Constructor sencillo de topologías usando líneas de texto o archivos CSV.\n"
@@ -1438,6 +1647,44 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "Resolver el sistema lineal (vías sympy) para obtener tensiones y corrientes."
         ),
+    )
+    parser.add_argument(
+        "--lcapy-solve",
+        nargs="+",
+        choices=["node", "branch", "mesh"],
+        metavar="SCOPE",
+        help=(
+            "Resolver en el dominio s con Lcapy (cct_s.solve_laplace o equivalente) "
+            "para tensiones de nodo, corrientes/tensiones de rama o corrientes de malla."
+        ),
+    )
+    parser.add_argument(
+        "--solution-vars",
+        nargs="+",
+        metavar="VAR",
+        help="Variables concretas a mostrar al usar --lcapy-solve (por nombre de nodo/rama/malla).",
+    )
+    parser.add_argument(
+        "--solution-time",
+        action="store_true",
+        help=(
+            "Transformar las soluciones simbólicas al dominio del tiempo con inverse_laplace()/time() antes de mostrarlas."
+        ),
+    )
+    parser.add_argument(
+        "--solution-simplify",
+        action="store_true",
+        help="Aplicar sympy.simplify a las soluciones calculadas por Lcapy antes de imprimirlas.",
+    )
+    parser.add_argument(
+        "--solution-factor",
+        action="store_true",
+        help="Factorizar denominadores/terminos para mejorar la legibilidad de las soluciones en consola.",
+    )
+    parser.add_argument(
+        "--solution-collect",
+        metavar="SYMBOL",
+        help="Agrupar términos respecto a un símbolo (por ejemplo s o t) al mostrar las soluciones.",
     )
     parser.add_argument(
         "--analyze",
@@ -1550,6 +1797,13 @@ def print_symbolic(label: str, summary: dict, method: str, show_matrices: bool) 
         print("\nSoluciones:")
         for var, expr in summary["solutions"].items():
             print(f" {var} = {expr}")
+
+    if summary.get("lcapy_solutions"):
+        print("\nSoluciones (Lcapy):")
+        for scope, entries in summary["lcapy_solutions"].items():
+            print(f" [{scope}]")
+            for var, expr in entries.items():
+                print(f"  {var} = {expr}")
 
     if summary.get("plots"):
         print("\nGráficas generadas:")
@@ -1804,6 +2058,12 @@ def run(args: argparse.Namespace) -> dict:
         analysis_summary = symbolic_analysis(
             graph, domain, method, args.show_matrices, circuit_variant
         )
+        _inject_lcapy_solutions(
+            analysis_summary,
+            circuit_variant,
+            args,
+            set(args.solution_vars) if args.solution_vars else None,
+        )
         analysis_summary, solutions = enrich_analysis(
             analysis_summary, "single", args, substitutions, requested_set
         )
@@ -1856,6 +2116,12 @@ def run(args: argparse.Namespace) -> dict:
     analysis_pre = symbolic_analysis(
         graph_pre, domain, method, args.show_matrices, circuit_variant_pre
     )
+    _inject_lcapy_solutions(
+        analysis_pre,
+        circuit_variant_pre,
+        args,
+        set(args.solution_vars) if args.solution_vars else None,
+    )
     analysis_pre, solutions_pre = enrich_analysis(
         analysis_pre,
         "pre",
@@ -1871,6 +2137,12 @@ def run(args: argparse.Namespace) -> dict:
     circuit_variant_post = _circuit_for_domain(entry_post, domain)
     analysis_post = symbolic_analysis(
         graph_post, domain, method, args.show_matrices, circuit_variant_post
+    )
+    _inject_lcapy_solutions(
+        analysis_post,
+        circuit_variant_post,
+        args,
+        set(args.solution_vars) if args.solution_vars else None,
     )
     analysis_post, solutions_post = enrich_analysis(
         analysis_post,
